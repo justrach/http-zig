@@ -45,11 +45,7 @@ pub const Session = struct {
         };
         self.dialH2() catch |err| {
             self.teardownH2();
-            if (!handshakeFallback(err)) {
-                self.gpa.free(self.host);
-                self.gpa.destroy(self);
-                return err;
-            }
+            if (!handshakeFallback(err)) return err;
             self.h1_only = true;
             return self;
         };
@@ -188,6 +184,8 @@ pub fn handshakeFallback(err: anyerror) bool {
         error.TlsIllegalParameter,
         error.TlsConnectionTruncated,
         error.TlsBadRecordMac,
+        error.TlsRecordOverflow,
+        error.TlsInitializationFailed,
         => true,
         else => false,
     };
