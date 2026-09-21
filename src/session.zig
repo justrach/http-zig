@@ -100,22 +100,29 @@ pub const Session = struct {
     fn dialH2(self: *Session) !void {
         const host_name = try Io.net.HostName.init(self.host);
         const stream = try host_name.connect(self.io, self.port, .{ .mode = .stream });
-        errdefer stream.close(self.io);
+        // Once these fields are assigned, open()'s teardownH2 owns the socket
+        // and the buffers. The errdefers must not also close/free them: a
+        // failed handshake was closing the fd twice, and debug zig treats
+        // that BADF as unreachable, which aborts the process and crashes the
+        // zig 0.17 test runner (codegraff pre-push reach/tests).
+        var owned = false;
+        errdefer if (!owned) stream.close(self.io);
         const n = tls_client.min_buffer_len;
         const sock_read = try self.gpa.alloc(u8, n);
-        errdefer self.gpa.free(sock_read);
+        errdefer if (!owned) self.gpa.free(sock_read);
         const sock_write = try self.gpa.alloc(u8, n);
-        errdefer self.gpa.free(sock_write);
+        errdefer if (!owned) self.gpa.free(sock_write);
         const tls_read = try self.gpa.alloc(u8, n);
-        errdefer self.gpa.free(tls_read);
+        errdefer if (!owned) self.gpa.free(tls_read);
         const tls_write = try self.gpa.alloc(u8, n);
-        errdefer self.gpa.free(tls_write);
+        errdefer if (!owned) self.gpa.free(tls_write);
 
         self.stream = stream;
         self.sock_read = sock_read;
         self.sock_write = sock_write;
         self.tls_read = tls_read;
         self.tls_write = tls_write;
+        owned = true;
         self.stream_reader = stream.reader(self.io, sock_read);
         self.stream_writer = stream.writer(self.io, sock_write);
 
