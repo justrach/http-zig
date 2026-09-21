@@ -52,8 +52,8 @@ pub fn write(w: *std.Io.Writer, f: Frame) !void {
 pub fn read(r: *std.Io.Reader, buf: []u8) !Frame {
     const hdr = try r.takeArray(9);
     const len: usize = (@as(usize, hdr[0]) << 16) | (@as(usize, hdr[1]) << 8) | hdr[2];
-    if (len > buf.len) return error.FrameTooLarge;
     const stream_id: u31 = @truncate(((@as(u32, hdr[5]) << 24) | (@as(u32, hdr[6]) << 16) | (@as(u32, hdr[7]) << 8) | hdr[8]) & 0x7fff_ffff);
+    if (len > buf.len) return error.FrameTooLarge;
     if (len > 0) {
         const got = try r.take(len);
         @memcpy(buf[0..len], got);

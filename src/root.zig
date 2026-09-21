@@ -4,6 +4,8 @@ pub const hpack = @import("hpack.zig");
 pub const huffman = @import("huffman.zig");
 pub const conn = @import("conn.zig");
 pub const client = @import("client.zig");
+pub const alpn = @import("alpn.zig");
+pub const https = @import("https.zig");
 
 pub const Conn = conn.Conn;
 pub const Request = conn.Request;
@@ -17,4 +19,6 @@ test {
     _ = huffman;
     _ = conn;
     _ = client;
+    _ = alpn;
+    _ = https;
 }

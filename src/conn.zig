@@ -28,6 +28,22 @@ pub const Response = struct {
     }
 };
 
+fn stripFramePayload(flags: u8, payload: []const u8) ![]const u8 {
+    var p = payload;
+    if (flags & frame.flags.padded != 0) {
+        if (p.len == 0) return error.ShortFrame;
+        const pad = p[0];
+        p = p[1..];
+        if (p.len < pad) return error.ShortFrame;
+        p = p[0 .. p.len - pad];
+    }
+    if (flags & frame.flags.priority != 0) {
+        if (p.len < 5) return error.ShortFrame;
+        p = p[5..];
+    }
+    return p;
+}
+
 pub const Conn = struct {
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
@@ -112,7 +128,8 @@ pub const Conn = struct {
                 .rst_stream => if (f.stream_id == sid) return error.RstStream,
                 .headers, .continuation => {
                     if (f.stream_id != sid) continue;
-                    const decoded = try self.decoder.decode(f.payload);
+                    const payload = try stripFramePayload(f.flags, f.payload);
+                    const decoded = try self.decoder.decode(payload);
                     defer self.allocator.free(decoded);
                     for (decoded) |h| {
                         if (std.mem.eql(u8, h.name, ":status")) {
@@ -124,7 +141,8 @@ pub const Conn = struct {
                 },
                 .data => {
                     if (f.stream_id != sid) continue;
-                    try body.appendSlice(self.allocator, f.payload);
+                    const payload = try stripFramePayload(f.flags, f.payload);
+                    try body.appendSlice(self.allocator, payload);
                     if (f.flags & frame.flags.end_stream != 0) ended = true;
                 },
                 else => {},
