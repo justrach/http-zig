@@ -55,6 +55,12 @@ pub const LineStream = struct {
         self.pending.deinit(self.conn.allocator);
     }
 
+    pub fn waitStatus(self: *LineStream) !u16 {
+        while (self.status == 0 and !self.ended) try self.pull();
+        if (self.status == 0) return error.NoStatus;
+        return self.status;
+    }
+
     /// True when a line (without LF) was written to `dest`. False at END_STREAM.
     pub fn readLine(self: *LineStream, dest: *std.ArrayList(u8)) !bool {
         dest.clearRetainingCapacity();
