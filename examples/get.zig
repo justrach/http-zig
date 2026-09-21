@@ -1,4 +1,4 @@
-//! GET an HTTPS URL over HTTP/2. Default: https://nghttp2.org/
+//! Two GETs on one HTTP/2 session. Default origin: https://nghttp2.org/
 const std = @import("std");
 const http_zig = @import("http_zig");
 
@@ -11,15 +11,24 @@ pub fn main() !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const url = "https://nghttp2.org/";
+    const s = try http_zig.Session.open(gpa, io, "nghttp2.org", 443);
+    defer s.close();
 
-    std.debug.print("GET {s} (HTTP/2)\n", .{url});
-    var res = http_zig.https.get(gpa, io, url) catch |err| {
-        std.debug.print("error: {s}\n", .{@errorName(err)});
-        return err;
-    };
-    defer res.deinit();
-    std.debug.print("status {d}  body {d} bytes\n", .{ res.status, res.body.len });
-    const n = @min(res.body.len, 240);
-    std.debug.print("{s}\n", .{res.body[0..n]});
+    var i: u8 = 0;
+    while (i < 2) : (i += 1) {
+        var res = try s.request(.{
+            .method = "GET",
+            .scheme = "https",
+            .authority = "nghttp2.org",
+            .path = "/",
+        });
+        defer res.deinit();
+        std.debug.print("GET #{d} stream~{d} status {d} body {d} h1_only={}\n", .{
+            i + 1,
+            s.last_stream,
+            res.status,
+            res.body.len,
+            s.h1_only,
+        });
+    }
 }

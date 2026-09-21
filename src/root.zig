@@ -6,8 +6,10 @@ pub const conn = @import("conn.zig");
 pub const client = @import("client.zig");
 pub const alpn = @import("alpn.zig");
 pub const https = @import("https.zig");
+pub const session = @import("session.zig");
 
 pub const Conn = conn.Conn;
+pub const Session = session.Session;
 pub const Request = conn.Request;
 pub const Response = conn.Response;
 pub const Header = hpack.Header;
@@ -21,4 +23,5 @@ test {
     _ = client;
     _ = alpn;
     _ = https;
+    _ = session;
 }

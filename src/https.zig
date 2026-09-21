@@ -1,12 +1,14 @@
-//! HTTPS HTTP/2: TCP + std TLS with ALPN spliced into ClientHello.
+//! HTTPS helpers over a reusable Session.
 
 const std = @import("std");
 const Io = std.Io;
-const conn_mod = @import("conn.zig");
-const tls_client = @import("tls_client.zig");
+const session_mod = @import("session.zig");
 
-pub const Response = conn_mod.Response;
-pub const Request = conn_mod.Request;
+pub const Session = session_mod.Session;
+pub const Request = session_mod.Request;
+pub const Response = session_mod.Response;
+pub const handshakeFallback = session_mod.handshakeFallback;
+pub const transportFallback = session_mod.transportFallback;
 
 pub const Url = struct {
     host: []const u8,
@@ -31,68 +33,14 @@ pub fn parseHttpsUrl(url: []const u8) !Url {
 
 pub fn get(gpa: std.mem.Allocator, io: Io, url: []const u8) !Response {
     const u = try parseHttpsUrl(url);
-    return request(gpa, io, .{
+    const s = try Session.open(gpa, io, u.host, u.port);
+    defer s.close();
+    return s.request(.{
         .method = "GET",
         .scheme = "https",
         .authority = u.host,
         .path = u.path,
-    }, u.host, u.port);
-}
-
-pub fn request(gpa: std.mem.Allocator, io: Io, req: Request, host: []const u8, port: u16) !Response {
-    const host_name = try Io.net.HostName.init(host);
-    const stream = try host_name.connect(io, port, .{ .mode = .stream });
-    errdefer stream.close(io);
-
-    const tls_buf_len = tls_client.min_buffer_len;
-    const sock_read = try gpa.alloc(u8, tls_buf_len);
-    defer gpa.free(sock_read);
-    const sock_write = try gpa.alloc(u8, tls_buf_len);
-    defer gpa.free(sock_write);
-    const tls_read = try gpa.alloc(u8, tls_buf_len);
-    defer gpa.free(tls_read);
-    const tls_write = try gpa.alloc(u8, tls_buf_len);
-    defer gpa.free(tls_write);
-    var stream_reader = stream.reader(io, sock_read);
-    var stream_writer = stream.writer(io, sock_write);
-
-    var ca: std.crypto.Certificate.Bundle = .empty;
-    var ca_lock: Io.RwLock = .init;
-    const now = Io.Clock.real.now(io);
-    try ca.rescan(gpa, io, now);
-    defer ca.deinit(gpa);
-
-    var entropy: [tls_client.Options.entropy_len]u8 = undefined;
-    io.random(&entropy);
-
-    var tls = tls_client.init(
-        &stream_reader.interface,
-        &stream_writer.interface,
-        .{
-            .host = .{ .explicit = host },
-            .ca = .{ .bundle = .{
-                .gpa = gpa,
-                .io = io,
-                .lock = &ca_lock,
-                .bundle = &ca,
-            } },
-            .read_buffer = tls_read,
-            .write_buffer = tls_write,
-            .entropy = &entropy,
-            .realtime_now = now,
-            .allow_truncation_attacks = true,
-        },
-    ) catch |err| switch (err) {
-        error.WriteFailed => return stream_writer.err orelse error.WriteFailed,
-        error.ReadFailed => return stream_reader.err orelse error.ReadFailed,
-        else => |e| return e,
-    };
-
-    var c = conn_mod.Conn.init(gpa, &tls.reader, &tls.writer);
-    defer c.deinit();
-    const res = try c.request(req);
-    stream.close(io);
-    return res;
+    });
 }
 
 test "parseHttpsUrl" {
