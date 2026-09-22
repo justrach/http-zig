@@ -12,6 +12,7 @@ pub const Conn = conn.Conn;
 pub const Session = session.Session;
 pub const Request = conn.Request;
 pub const Response = conn.Response;
+pub const LineStream = session.LineStream;
 pub const Header = hpack.Header;
 pub const preface = frame.preface;
 

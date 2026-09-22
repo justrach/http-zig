@@ -1011,6 +1011,9 @@ fn flush(w: *Writer) Writer.Error!void {
     const prepared = prepareCiphertextRecord(c, ciphertext_buf, w.buffered(), .application_data);
     output.advance(prepared.ciphertext_end);
     w.end = 0;
+    // Ciphertext only reaches the socket writer buffer. std.http.Client
+    // flushes that writer too; without it the next request never leaves.
+    try output.flush();
 }
 
 /// Sends a `close_notify` alert, which is necessary for the server to

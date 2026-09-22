@@ -82,10 +82,24 @@ pub const Session = struct {
         };
     }
 
-    /// Streaming DATA as lines (SSE). Null at END_STREAM.
+    /// Streaming DATA as lines (SSE). Same redial as `request`: a dead h2
+    /// connection is dialed again before latching HTTP/1.1.
     pub fn startLines(self: *Session, req: Request) !LineStream {
         if (self.h1_only) return error.H1NoStream;
         return self.conn.startLines(req) catch |err| {
+            if (err == error.EndOfStream or err == error.GoAway) {
+                self.teardownH2();
+                self.dialH2() catch {
+                    self.h1_only = true;
+                    return error.H1NoStream;
+                };
+                return self.conn.startLines(req) catch |e2| {
+                    if (!transportFallback(e2)) return e2;
+                    self.teardownH2();
+                    self.h1_only = true;
+                    return error.H1NoStream;
+                };
+            }
             if (!transportFallback(err)) return err;
             self.teardownH2();
             self.h1_only = true;
