@@ -25,4 +25,9 @@ test {
     _ = alpn;
     _ = https;
     _ = session;
+    _ = @import("flow.zig");
+    _ = @import("conn_tests.zig");
+    // tls_client is reached only through session, which pulls its decls but
+    // not its tests: reference it here or those 3 tests compile to nothing.
+    _ = @import("tls_client.zig");
 }

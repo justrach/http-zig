@@ -163,8 +163,11 @@ pub const Session = struct {
             else => |e| return e,
         };
         self.conn = conn_mod.Conn.init(self.gpa, &self.tls.reader, &self.tls.writer);
-        try self.conn.preface();
+        // Own the Conn before preface(): it holds an HPACK decoder allocation,
+        // so marking it live first makes teardownH2 free it when preface()
+        // fails. Marking it after leaked that allocation on every failed dial.
         self.h2_live = true;
+        try self.conn.preface();
     }
 
     fn requestH2(self: *Session, req: Request) !Response {
