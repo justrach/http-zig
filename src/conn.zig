@@ -563,3 +563,46 @@ test "conn fragmented headers reassemble before HPACK decode" {
     }
     try std.testing.expect(found);
 }
+
+test "conn server push keeps HPACK in sync" {
+    const gpa = std.testing.allocator;
+    // nghttp2.org pushes style.css: PUSH_PROMISE + pushed HEADERS both carry
+    // incremental entries. Skipping their decode desyncs the dynamic table
+    // and the next response fails with HpackIndex.
+    var srv_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer srv_aw.deinit();
+    try frame.write(&srv_aw.writer, .{ .typ = .settings, .flags = 0, .stream_id = 0, .payload = &.{} });
+    // PUSH_PROMISE sid=1, promised 2: incremental x-req: r (adds index 62).
+    const promise = [_]u8{ 0, 0, 0, 2, 0x40, 0x05, 'x', '-', 'r', 'e', 'q', 0x01, 'r' };
+    try frame.write(&srv_aw.writer, .{ .typ = .push_promise, .flags = frame.flags.end_headers, .stream_id = 1, .payload = &promise });
+    // Main response headers sid=1: :status 200.
+    const status_hpack = [_]u8{0x88};
+    try frame.write(&srv_aw.writer, .{ .typ = .headers, .flags = frame.flags.end_headers, .stream_id = 1, .payload = &status_hpack });
+    // Pushed response HEADERS sid=2: :status 200 + incremental x-pushed: yes (adds 63).
+    const pushed = [_]u8{ 0x88, 0x40, 0x08, 'x', '-', 'p', 'u', 's', 'h', 'e', 'd', 0x03, 'y', 'e', 's' };
+    try frame.write(&srv_aw.writer, .{ .typ = .headers, .flags = frame.flags.end_headers, .stream_id = 2, .payload = &pushed });
+    try frame.write(&srv_aw.writer, .{ .typ = .data, .flags = frame.flags.end_stream, .stream_id = 2, .payload = "css" });
+    try frame.write(&srv_aw.writer, .{ .typ = .data, .flags = frame.flags.end_stream, .stream_id = 1, .payload = "ok" });
+    // Second response references the pushed entry (newest => index 62).
+    const ref = [_]u8{ 0x88, 0xbe };
+    try frame.write(&srv_aw.writer, .{ .typ = .headers, .flags = frame.flags.end_headers, .stream_id = 3, .payload = &ref });
+    try frame.write(&srv_aw.writer, .{ .typ = .data, .flags = frame.flags.end_stream, .stream_id = 3, .payload = "two" });
+    const server_bytes = try gpa.dupe(u8, srv_aw.written());
+    defer gpa.free(server_bytes);
+    var reader: std.Io.Reader = .fixed(server_bytes);
+    var client_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer client_aw.deinit();
+    var c = Conn.init(gpa, &reader, &client_aw.writer);
+    defer c.deinit();
+    var a = try c.request(.{ .method = "GET", .scheme = "http", .authority = "localhost", .path = "/" });
+    defer a.deinit();
+    try std.testing.expectEqualStrings("ok", a.body);
+    var b = try c.request(.{ .method = "GET", .scheme = "http", .authority = "localhost", .path = "/" });
+    defer b.deinit();
+    try std.testing.expectEqualStrings("two", b.body);
+    var found = false;
+    for (b.headers) |h| {
+        if (std.mem.eql(u8, h.name, "x-pushed") and std.mem.eql(u8, h.value, "yes")) found = true;
+    }
+    try std.testing.expect(found);
+}
