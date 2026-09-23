@@ -1007,10 +1007,9 @@ fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize 
 fn flush(w: *Writer) Writer.Error!void {
     const c: *Client = @alignCast(@fieldParentPtr("writer", w));
     const output = c.output;
-    const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
-    const prepared = prepareCiphertextRecord(c, ciphertext_buf, w.buffered(), .application_data);
-    output.advance(prepared.ciphertext_end);
-    w.end = 0;
+    // Encryption may consume only part of the buffered plaintext when the
+    // ciphertext buffer fills. Drain until every byte has been consumed.
+    try Writer.defaultFlush(w);
     // Ciphertext only reaches the socket writer buffer. std.http.Client
     // flushes that writer too; without it the next request never leaves.
     try output.flush();
@@ -1766,4 +1765,8 @@ test "TLS 1.2 record shorter than IV plus tag" {
         .tls_1_2,
         .{ .AES_128_GCM_SHA256 = .{ .tls_1_2 = mem.zeroes(P.Tls_1_2) } },
     ));
+}
+
+test "TLS flush preserves plaintext across ciphertext buffer boundaries" {
+    try @import("tls_flush_test.zig").check(Client, drain, flush);
 }
