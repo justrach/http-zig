@@ -46,9 +46,13 @@ pub const Flow = struct {
     pub fn onWindowUpdate(self: *Flow, sid: u31, inc: u32) !void {
         if (inc == 0) return error.FlowControlZeroIncrement;
         const grow: i64 = @intCast(inc);
+        // A window above 2^31-1 is a FLOW_CONTROL_ERROR (RFC 9113 §6.9.1).
+        const max_win: i64 = 0x7fff_ffff;
         if (sid == 0) {
+            if (self.conn_win + grow > max_win) return error.FlowControlOverflow;
             self.conn_win += grow;
         } else if (sid == self.stream_sid) {
+            if (self.stream_win + grow > max_win) return error.FlowControlOverflow;
             self.stream_win += grow;
         }
     }

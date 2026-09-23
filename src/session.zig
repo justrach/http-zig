@@ -58,6 +58,11 @@ pub const Session = struct {
         self.gpa.destroy(self);
     }
 
+    /// True when the next stream can go out on the live h2 connection.
+    pub fn reusable(self: *const Session) bool {
+        return !self.h1_only and self.h2_live and self.conn.acceptsStreams();
+    }
+
     pub fn request(self: *Session, req: Request) !Response {
         if (self.h1_only) return requestH1(self.gpa, self.io, req, self.host, self.port);
         return self.requestH2(req) catch |err| {
@@ -86,6 +91,18 @@ pub const Session = struct {
     /// connection is dialed again before latching HTTP/1.1.
     pub fn startLines(self: *Session, req: Request) !LineStream {
         if (self.h1_only) return error.H1NoStream;
+        // A connection the peer is draining (GOAWAY seen on an earlier stream)
+        // takes no new streams: dial a fresh one instead of letting the next
+        // request fail on it.
+        if (!self.h2_live or !self.conn.acceptsStreams()) {
+            self.teardownH2();
+            self.dialH2() catch |err| {
+                self.teardownH2();
+                if (!handshakeFallback(err)) return err;
+                self.h1_only = true;
+                return error.H1NoStream;
+            };
+        }
         return self.conn.startLines(req) catch |err| {
             if (err == error.EndOfStream or err == error.GoAway) {
                 self.teardownH2();
@@ -162,6 +179,10 @@ pub const Session = struct {
             error.ReadFailed => return self.stream_reader.err orelse error.ReadFailed,
             else => |e| return e,
         };
+        // RFC 9113 §3.2: speak HTTP/2 only when the server chose h2 via ALPN.
+        // A server that picked http/1.1 or ignored ALPN would otherwise get the
+        // preface and a request body it cannot parse.
+        if (!self.tls.alpn_h2) return error.AlpnNotH2;
         self.conn = conn_mod.Conn.init(self.gpa, &self.tls.reader, &self.tls.writer);
         // Own the Conn before preface(): it holds an HPACK decoder allocation,
         // so marking it live first makes teardownH2 free it when preface()
@@ -203,6 +224,7 @@ pub fn handshakeFallback(err: anyerror) bool {
         error.TlsBadRecordMac,
         error.TlsRecordOverflow,
         error.TlsInitializationFailed,
+        error.AlpnNotH2,
         => true,
         else => false,
     };
@@ -210,7 +232,7 @@ pub fn handshakeFallback(err: anyerror) bool {
 
 pub fn transportFallback(err: anyerror) bool {
     return handshakeFallback(err) or switch (err) {
-        error.GoAway, error.RstStream, error.FrameTooLarge, error.HpackIndex, error.HpackTruncated, error.EndOfStream => true,
+        error.GoAway, error.StreamRefused, error.RstStream, error.FrameTooLarge, error.HpackIndex, error.HpackTruncated, error.EndOfStream => true,
         else => false,
     };
 }

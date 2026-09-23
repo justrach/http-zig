@@ -7,6 +7,30 @@ const flow_mod = @import("flow.zig");
 /// Frames read while waiting for outbound credit before giving up on the peer.
 const max_credit_frames: u32 = 64;
 
+/// Header block (HEADERS + CONTINUATION) cap: stops an endless CONTINUATION
+/// run from growing memory (RFC 9113 §10.5.1).
+pub const max_header_block: usize = 256 * 1024;
+
+/// RST_STREAM / GOAWAY error codes this client acts on (RFC 9113 §7).
+const err_no_error: u32 = 0x0;
+const err_refused_stream: u32 = 0x7;
+
+fn errorCode(f: frame.Frame) u32 {
+    if (f.payload.len < 4) return 0xffff_ffff;
+    return std.mem.readInt(u32, f.payload[0..4], .big);
+}
+
+/// Map RST_STREAM on our stream to an error. REFUSED_STREAM means the server
+/// did no work (RFC 9113 §8.7), so the caller may safely resend.
+fn rstError(f: frame.Frame) anyerror {
+    return if (errorCode(f) == err_refused_stream) error.StreamRefused else error.RstStream;
+}
+
+fn appendBlock(block: *std.ArrayList(u8), gpa: std.mem.Allocator, part: []const u8) !void {
+    if (block.items.len + part.len > max_header_block) return error.HeaderBlockTooLarge;
+    try block.appendSlice(gpa, part);
+}
+
 pub const Request = struct {
     method: []const u8,
     scheme: []const u8,
@@ -32,7 +56,11 @@ pub const Response = struct {
     }
 };
 
-fn stripFramePayload(flags: u8, payload: []const u8) ![]const u8 {
+/// Drop padding (DATA, HEADERS, PUSH_PROMISE) and the priority block (HEADERS
+/// only). Flags a frame type does not define are ignored (RFC 9113 §4.1): on
+/// DATA 0x20 is not PRIORITY, and CONTINUATION carries neither.
+fn stripFramePayload(typ: frame.Type, flags: u8, payload: []const u8) ![]const u8 {
+    if (typ == .continuation) return payload;
     var p = payload;
     if (flags & frame.flags.padded != 0) {
         if (p.len == 0) return error.ShortFrame;
@@ -41,7 +69,7 @@ fn stripFramePayload(flags: u8, payload: []const u8) ![]const u8 {
         if (p.len < pad) return error.ShortFrame;
         p = p[0 .. p.len - pad];
     }
-    if (flags & frame.flags.priority != 0) {
+    if (typ == .headers and flags & frame.flags.priority != 0) {
         if (p.len < 5) return error.ShortFrame;
         p = p[5..];
     }
@@ -83,14 +111,7 @@ pub const LineStream = struct {
     }
 
     fn decodeBlock(self: *LineStream, block: []const u8) !void {
-        const decoded = try self.conn.decoder.decode(block);
-        defer self.conn.allocator.free(decoded);
-        for (decoded) |h| {
-            if (std.mem.eql(u8, h.name, ":status")) {
-                self.status = std.fmt.parseInt(u16, h.value, 10) catch 0;
-            }
-            try self.headers.append(self.conn.allocator, h);
-        }
+        self.status = try self.conn.decodeInto(&self.headers, block) orelse self.status;
     }
 
     /// True when a line (without LF) was written to `dest`. False at END_STREAM.
@@ -118,17 +139,25 @@ pub const LineStream = struct {
         // frames this stream must act on arrive here.
         const f = try self.conn.readFrame();
         switch (f.typ) {
-            .goaway => return error.GoAway,
-            .rst_stream => if (f.stream_id == self.sid) return error.RstStream,
+            .goaway => try self.conn.onGoAway(f, self.sid),
+            .rst_stream => if (f.stream_id == self.sid) {
+                // A complete response followed by RST_STREAM(NO_ERROR) is how a
+                // server stops an upload it no longer needs (RFC 9113 §8.1).
+                if (errorCode(f) == err_no_error and self.status != 0) {
+                    self.ended = true;
+                    return;
+                }
+                return rstError(f);
+            },
             .headers => {
                 if (f.stream_id != self.sid) {
                     // Pushed / other-stream headers: decode to keep the
                     // HPACK table in sync, then ignore.
-                    const payload = try stripFramePayload(f.flags, f.payload);
+                    const payload = try stripFramePayload(f.typ, f.flags, f.payload);
                     try self.conn.discardBlock(payload, f.flags, f.stream_id);
                     return;
                 }
-                const payload = try stripFramePayload(f.flags, f.payload);
+                const payload = try stripFramePayload(f.typ, f.flags, f.payload);
                 if (f.flags & frame.flags.end_stream != 0) self.hdr_end_stream = true;
                 if (f.flags & frame.flags.end_headers != 0) {
                     try self.decodeBlock(payload);
@@ -140,16 +169,15 @@ pub const LineStream = struct {
                     // arrives. Decoding fragments separately desyncs the
                     // HPACK dynamic table (HpackIndex on reuse).
                     self.hdr_block.clearRetainingCapacity();
-                    try self.hdr_block.appendSlice(self.conn.allocator, payload);
+                    try appendBlock(&self.hdr_block, self.conn.allocator, payload);
                     self.hdr_open = true;
                 }
             },
             .continuation => {
                 if (f.stream_id == self.sid) {
                     if (!self.hdr_open) return error.HpackTruncated;
-                    const payload = try stripFramePayload(f.flags, f.payload);
-                    if (f.flags & frame.flags.end_stream != 0) self.hdr_end_stream = true;
-                    try self.hdr_block.appendSlice(self.conn.allocator, payload);
+                    // END_STREAM rides on the HEADERS frame, never CONTINUATION.
+                    try appendBlock(&self.hdr_block, self.conn.allocator, f.payload);
                     if (f.flags & frame.flags.end_headers != 0) {
                         try self.decodeBlock(self.hdr_block.items);
                         self.hdr_block.clearRetainingCapacity();
@@ -166,14 +194,14 @@ pub const LineStream = struct {
             .push_promise => {
                 // Promised request headers are HPACK state too; decode and
                 // drop. Payload: 4-byte promised id + header block fragment.
-                const payload = try stripFramePayload(f.flags, f.payload);
+                const payload = try stripFramePayload(f.typ, f.flags, f.payload);
                 if (payload.len < 4) return error.HpackTruncated;
                 try self.conn.discardBlock(payload[4..], f.flags, f.stream_id);
             },
             .data => {
                 try self.conn.creditData(f.stream_id, f.payload.len);
                 if (f.stream_id != self.sid) return;
-                const payload = try stripFramePayload(f.flags, f.payload);
+                const payload = try stripFramePayload(f.typ, f.flags, f.payload);
                 try self.pending.appendSlice(self.conn.allocator, payload);
                 if (f.flags & frame.flags.end_stream != 0) self.ended = true;
             },
@@ -196,6 +224,9 @@ pub const Conn = struct {
     /// Frames read while draining for outbound credit mid-send. They belong to
     /// the response, so readRaw replays them instead of dropping them.
     pending_wire: std.ArrayList(u8) = .empty,
+    /// Last-stream-id from the peer's GOAWAY: the connection is draining and
+    /// takes no new streams (RFC 9113 §6.8).
+    goaway_last: ?u31 = null,
 
     pub fn init(allocator: std.mem.Allocator, reader: *std.Io.Reader, writer: *std.Io.Writer) Conn {
         return .{
@@ -210,6 +241,20 @@ pub const Conn = struct {
     pub fn deinit(self: *Conn) void {
         self.decoder.deinit();
         self.pending_wire.deinit(self.allocator);
+    }
+
+    pub fn acceptsStreams(self: *const Conn) bool {
+        return self.goaway_last == null;
+    }
+
+    /// GOAWAY (RFC 9113 §6.8): a stream at or below last-stream-id may finish,
+    /// so keep reading it. Above it the server never processed the stream, so
+    /// error.GoAway means "safe to resend elsewhere".
+    fn onGoAway(self: *Conn, f: frame.Frame, sid: u31) !void {
+        if (f.payload.len < 8) return error.GoAway;
+        const last: u31 = @truncate(std.mem.readInt(u32, f.payload[0..4], .big) & 0x7fff_ffff);
+        self.goaway_last = if (self.goaway_last) |prev| @min(prev, last) else last;
+        if (sid > last) return error.GoAway;
     }
 
     pub fn preface(self: *Conn) !void {
@@ -264,7 +309,7 @@ pub const Conn = struct {
         while (off < body.len) {
             const n = self.flow.allowed();
             if (n == 0) {
-                try self.awaitCredit(sid);
+                if (try self.awaitCredit(sid)) return;
                 continue;
             }
             const take = @min(n, body.len - off);
@@ -279,8 +324,10 @@ pub const Conn = struct {
 
     /// Read frames until the outbound window reopens. A peer that never credits
     /// must not hang the caller, so this gives up after max_credit_frames and
-    /// surfaces an error the caller can fall back from.
-    fn awaitCredit(self: *Conn, sid: u31) !void {
+    /// surfaces an error the caller can fall back from. Returns true when the
+    /// peer ended our stream with RST_STREAM(NO_ERROR) after answering early
+    /// (RFC 9113 §8.1): the upload stops and the stashed response is read.
+    fn awaitCredit(self: *Conn, sid: u31) !bool {
         var attempts: u32 = 0;
         while (self.flow.allowed() == 0) {
             attempts += 1;
@@ -289,10 +336,18 @@ pub const Conn = struct {
             // response data waiting to be replayed: pulling it here just to
             // stash it again spins on one frame and never reaches the credit.
             const f = try frame.read(self.reader, &self.buf);
-            if (f.typ == .goaway) return error.GoAway;
-            if (f.typ == .rst_stream and f.stream_id == sid) return error.RstStream;
+            if (f.typ == .goaway) {
+                try self.onGoAway(f, sid);
+                continue;
+            }
+            if (f.typ == .rst_stream and f.stream_id == sid) {
+                if (errorCode(f) != err_no_error) return rstError(f);
+                try self.stashFrame(f);
+                return true;
+            }
             if (!try self.absorb(f)) try self.stashFrame(f);
         }
+        return false;
     }
 
     /// Keep a frame that arrived while we were still sending. Its payload points
@@ -337,7 +392,8 @@ pub const Conn = struct {
             },
             .window_update => {
                 if (f.payload.len < 4) return error.FlowControlBadFrame;
-                try self.flow.onWindowUpdate(f.stream_id, std.mem.readInt(u32, f.payload[0..4], .big));
+                // The high bit is reserved and must be ignored (RFC 9113 §6.9).
+                try self.flow.onWindowUpdate(f.stream_id, std.mem.readInt(u32, f.payload[0..4], .big) & 0x7fff_ffff);
             },
             .priority => {},
             else => return false,
@@ -387,13 +443,12 @@ pub const Conn = struct {
         }
         var acc: std.ArrayList(u8) = .empty;
         defer acc.deinit(self.allocator);
-        try acc.appendSlice(self.allocator, first);
+        try appendBlock(&acc, self.allocator, first);
         var fl = flags;
         while (fl & frame.flags.end_headers == 0) {
-            const c = try frame.read(self.reader, &self.buf);
+            const c = try self.readRaw(); // may already sit in the credit-drain stash
             if (c.typ != .continuation or c.stream_id != sid) return error.HpackTruncated;
-            const cp = try stripFramePayload(c.flags, c.payload);
-            try acc.appendSlice(self.allocator, cp);
+            try appendBlock(&acc, self.allocator, c.payload);
             fl = c.flags;
         }
         const dec = try self.decoder.decode(acc.items);
@@ -404,15 +459,32 @@ pub const Conn = struct {
         }
     }
 
-    fn decodeBlock(self: *Conn, headers: *std.ArrayList(hpack.Header), status: *u16, block: []const u8) !void {
+    /// Decode one response header block into `headers` and return its
+    /// :status. An interim 1xx block (100, 103 Early Hints) is decoded -- the
+    /// HPACK table must stay in sync -- and dropped, returning null: the final
+    /// response is still coming (RFC 9113 §8.1).
+    fn decodeInto(self: *Conn, headers: *std.ArrayList(hpack.Header), block: []const u8) !?u16 {
         const decoded = try self.decoder.decode(block);
         defer self.allocator.free(decoded);
+        var status: u16 = 0;
         for (decoded) |h| {
-            if (std.mem.eql(u8, h.name, ":status")) {
-                status.* = std.fmt.parseInt(u16, h.value, 10) catch 0;
-            }
-            try headers.append(self.allocator, h);
+            if (std.mem.eql(u8, h.name, ":status")) status = std.fmt.parseInt(u16, h.value, 10) catch 0;
         }
+        const interim = status >= 100 and status < 200;
+        var kept: usize = 0;
+        errdefer for (decoded[kept..]) |h| {
+            self.allocator.free(h.name);
+            self.allocator.free(h.value);
+        };
+        for (decoded) |h| {
+            if (interim) {
+                self.allocator.free(h.name);
+                self.allocator.free(h.value);
+            } else try headers.append(self.allocator, h);
+            kept += 1;
+        }
+        if (interim or status == 0) return null;
+        return status;
     }
 
     pub fn startLines(self: *Conn, req: Request) !LineStream {
@@ -453,20 +525,26 @@ pub const Conn = struct {
         while (!ended) {
             const f = try self.readFrame();
             switch (f.typ) {
-                .goaway => return error.GoAway,
-                .rst_stream => if (f.stream_id == sid) return error.RstStream,
+                .goaway => try self.onGoAway(f, sid),
+                .rst_stream => if (f.stream_id == sid) {
+                    if (errorCode(f) == err_no_error and status != 0) {
+                        ended = true;
+                        continue;
+                    }
+                    return rstError(f);
+                },
                 .headers => {
                     if (f.stream_id != sid) {
                         // Pushed / other-stream headers: decode to keep the
                         // HPACK table in sync, then ignore.
-                        const payload = try stripFramePayload(f.flags, f.payload);
+                        const payload = try stripFramePayload(f.typ, f.flags, f.payload);
                         try self.discardBlock(payload, f.flags, f.stream_id);
                         continue;
                     }
-                    const payload = try stripFramePayload(f.flags, f.payload);
-                    var end_stream = f.flags & frame.flags.end_stream != 0;
+                    const payload = try stripFramePayload(f.typ, f.flags, f.payload);
+                    const end_stream = f.flags & frame.flags.end_stream != 0;
                     if (f.flags & frame.flags.end_headers != 0) {
-                        try decodeBlock(self, &headers, &status, payload);
+                        status = try self.decodeInto(&headers, payload) orelse status;
                     } else {
                         // Fragmented header block (RFC 7540 §4.3): HEADERS
                         // without END_HEADERS is followed by CONTINUATION
@@ -474,24 +552,20 @@ pub const Conn = struct {
                         // dynamic table desyncs (HpackIndex on reuse).
                         var hblock: std.ArrayList(u8) = .empty;
                         defer hblock.deinit(self.allocator);
-                        try hblock.appendSlice(self.allocator, payload);
+                        try appendBlock(&hblock, self.allocator, payload);
                         var hflags: u8 = f.flags;
                         while (hflags & frame.flags.end_headers == 0) {
                             const c = try self.readFrame();
                             switch (c.typ) {
-                                .goaway => return error.GoAway,
-                                .rst_stream => if (c.stream_id == sid) return error.RstStream,
                                 .continuation => {
                                     if (c.stream_id != sid) return error.HpackTruncated;
-                                    const cp = try stripFramePayload(c.flags, c.payload);
-                                    try hblock.appendSlice(self.allocator, cp);
-                                    if (c.flags & frame.flags.end_stream != 0) end_stream = true;
+                                    try appendBlock(&hblock, self.allocator, c.payload);
                                     hflags = c.flags;
                                 },
                                 else => return error.HpackTruncated,
                             }
                         }
-                        try decodeBlock(self, &headers, &status, hblock.items);
+                        status = try self.decodeInto(&headers, hblock.items) orelse status;
                     }
                     if (end_stream) ended = true;
                 },
@@ -499,14 +573,14 @@ pub const Conn = struct {
                 .push_promise => {
                     // Promised request headers are HPACK state too; decode
                     // and drop. Payload: 4-byte promised id + fragment.
-                    const payload = try stripFramePayload(f.flags, f.payload);
+                    const payload = try stripFramePayload(f.typ, f.flags, f.payload);
                     if (payload.len < 4) return error.HpackTruncated;
                     try self.discardBlock(payload[4..], f.flags, f.stream_id);
                 },
                 .data => {
                     try self.creditData(f.stream_id, f.payload.len);
                     if (f.stream_id != sid) continue;
-                    const payload = try stripFramePayload(f.flags, f.payload);
+                    const payload = try stripFramePayload(f.typ, f.flags, f.payload);
                     try body.appendSlice(self.allocator, payload);
                     if (f.flags & frame.flags.end_stream != 0) ended = true;
                 },

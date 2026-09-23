@@ -292,10 +292,13 @@ pub fn decode(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
         }
         if (matched) continue;
         if (i == src.len) break;
+        // No code is longer than 30 bits, so an unmatched run this long is
+        // EOS or garbage. Checking before the add keeps `have` inside u6:
+        // adding 8 to 56+ bits of all-ones input used to overflow it.
+        if (have > 52) return error.HuffmanOverflow;
         acc = (acc << 8) | src[i];
         have += 8;
         i += 1;
-        if (have > 60) return error.HuffmanOverflow;
     }
     // Remaining bits must be EOS prefix (all ones) and shorter than EOS (30).
     if (have > 7) return error.HuffmanPadding;
