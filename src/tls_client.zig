@@ -49,6 +49,10 @@ write_seq: u64,
 received_close_notify: bool,
 allow_truncation_attacks: bool,
 application_cipher: tls.ApplicationCipher,
+/// The server selected `h2` via ALPN (RFC 7301). False when it picked another
+/// protocol or ignored ALPN; the HTTP/2 preface must not be sent then
+/// (RFC 9113 §3.2).
+alpn_h2: bool = false,
 
 /// If non-null, ssl secrets are logged to a stream. Creating such a log file
 /// allows other programs with access to that file to decrypt all traffic over
@@ -334,6 +338,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
         finished,
     };
     var handshake_state: HandshakeState = .hello;
+    var alpn_h2 = false;
     var handshake_cipher: tls.HandshakeCipher = undefined;
     var main_cert_pub_key: CertificatePublicKey = undefined;
     var tls12_negotiated_group: ?tls.NamedGroup = null;
@@ -495,6 +500,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         try extd.ensure(key_size);
                                         try key_share.exchange(named_group, extd.slice(key_size));
                                     },
+                                    // TLS 1.2 carries the ALPN answer here.
+                                    .application_layer_protocol_negotiation => alpn_h2 = try alpnIsH2(&extd),
                                     else => {},
                                 }
                             }
@@ -597,10 +604,10 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             try all_extd.ensure(4);
                             const et = all_extd.decode(tls.ExtensionType);
                             const ext_size = all_extd.decode(u16);
-                            const extd = try all_extd.sub(ext_size);
-                            _ = extd;
+                            var extd = try all_extd.sub(ext_size);
                             switch (et) {
-                                .server_name => {},
+                                // TLS 1.3 carries the ALPN answer here.
+                                .application_layer_protocol_negotiation => alpn_h2 = try alpnIsH2(&extd),
                                 else => {},
                             }
                         }
@@ -958,6 +965,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             .allow_truncation_attacks = options.allow_truncation_attacks,
                             .application_cipher = app_cipher,
                             .ssl_key_log = options.ssl_key_log,
+                            .alpn_h2 = alpn_h2,
                         };
                     },
                     else => return error.TlsUnexpectedMessage,
@@ -970,6 +978,17 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
         cleartext_fragment_start = 0;
         cleartext_fragment_end = 0;
     }
+}
+
+/// Server ALPN answer: a ProtocolNameList holding exactly one name (RFC 7301
+/// §3.1). True only when that name is `h2`.
+fn alpnIsH2(d: *tls.Decoder) !bool {
+    try d.ensure(3);
+    const list_len = d.decode(u16);
+    const name_len = d.decode(u8);
+    if (list_len != @as(u16, name_len) + 1) return error.TlsDecodeError;
+    try d.ensure(name_len);
+    return mem.eql(u8, d.slice(name_len), "h2");
 }
 
 fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
@@ -1007,10 +1026,9 @@ fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize 
 fn flush(w: *Writer) Writer.Error!void {
     const c: *Client = @alignCast(@fieldParentPtr("writer", w));
     const output = c.output;
-    const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
-    const prepared = prepareCiphertextRecord(c, ciphertext_buf, w.buffered(), .application_data);
-    output.advance(prepared.ciphertext_end);
-    w.end = 0;
+    // Encryption may consume only part of the buffered plaintext when the
+    // ciphertext buffer fills. Drain until every byte has been consumed.
+    try Writer.defaultFlush(w);
     // Ciphertext only reaches the socket writer buffer. std.http.Client
     // flushes that writer too; without it the next request never leaves.
     try output.flush();
@@ -1019,6 +1037,15 @@ fn flush(w: *Writer) Writer.Error!void {
 /// Sends a `close_notify` alert, which is necessary for the server to
 /// distinguish between a properly finished TLS session, or a truncation
 /// attack.
+fn sendKeyUpdateReply(c: *Client) Writer.Error!void {
+    const reply = [_]u8{ @intFromEnum(tls.HandshakeType.key_update), 0, 0, 1, @intFromEnum(tls.KeyUpdateRequest.update_not_requested) };
+    const output = c.output;
+    const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
+    const prepared = prepareCiphertextRecord(c, ciphertext_buf, &reply, .handshake);
+    output.advance(prepared.ciphertext_end);
+    try output.flush();
+}
+
 pub fn end(c: *Client) Writer.Error!void {
     try flush(&c.writer);
     const output = c.output;
@@ -1263,6 +1290,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
         .handshake => {
             var ct_i: usize = 0;
             while (true) {
+                if (cleartext.len - ct_i < 4) return failRead(c, error.TlsBadLength);
                 const handshake_type: tls.HandshakeType = @enumFromInt(cleartext[ct_i]);
                 ct_i += 1;
                 const handshake_len = mem.readInt(u24, cleartext[ct_i..][0..3], .big);
@@ -1275,6 +1303,11 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                         // This client implementation ignores new session tickets.
                     },
                     .key_update => {
+                        // KeyUpdate exists only in TLS 1.3 (RFC 8446 §4.6.3) and
+                        // carries one byte. Reading tls_1_3 keys on a 1.2
+                        // connection would touch the wrong union field.
+                        if (c.tls_version != .tls_1_3) return failRead(c, error.TlsUnexpectedMessage);
+                        if (handshake.len != 1) return failRead(c, error.TlsDecodeError);
                         switch (c.application_cipher) {
                             inline else => |*p| {
                                 const pv = &p.tls_1_3;
@@ -1295,6 +1328,10 @@ fn readIndirect(c: *Client) Reader.Error!usize {
 
                         switch (@as(tls.KeyUpdateRequest, @enumFromInt(handshake[0]))) {
                             .update_requested => {
+                                // Answer under the old keys before rotating them,
+                                // or the server cannot decrypt anything we send
+                                // next (RFC 8446 §4.6.3).
+                                sendKeyUpdateReply(c) catch return failRead(c, error.TlsUnexpectedMessage);
                                 switch (c.application_cipher) {
                                     inline else => |*p| {
                                         const pv = &p.tls_1_3;
@@ -1766,4 +1803,8 @@ test "TLS 1.2 record shorter than IV plus tag" {
         .tls_1_2,
         .{ .AES_128_GCM_SHA256 = .{ .tls_1_2 = mem.zeroes(P.Tls_1_2) } },
     ));
+}
+
+test "TLS flush preserves plaintext across ciphertext buffer boundaries" {
+    try @import("tls_flush_test.zig").check(Client, drain, flush);
 }

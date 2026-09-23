@@ -104,6 +104,9 @@ pub const Decoder = struct {
     allocator: std.mem.Allocator,
     dynamic: std.ArrayList(Header),
     table_size: usize = 4096,
+    /// SETTINGS_HEADER_TABLE_SIZE this side advertised (default 4096). A
+    /// dynamic table size update may not exceed it (RFC 7541 §4.2, §6.3).
+    max_table_size: usize = 4096,
     used: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Decoder {
@@ -133,20 +136,33 @@ pub const Decoder = struct {
             if (b & 0x80 != 0) {
                 const idx, const n = try readInteger(src, i, 7);
                 i = n;
-                const h = try self.lookup(idx);
-                try out.append(self.allocator, try self.dup(h));
+                const copy = try self.dup(try self.lookup(idx));
+                errdefer {
+                    self.allocator.free(copy.name);
+                    self.allocator.free(copy.value);
+                }
+                try out.append(self.allocator, copy);
             } else if (b & 0xc0 == 0x40) {
                 const idx, const n = try readInteger(src, i, 6);
                 i = n;
                 const name, const val, const n2 = try self.readNameValue(src, i, idx);
                 i = n2;
+                defer self.allocator.free(name);
+                defer self.allocator.free(val);
                 try self.addDynamic(name, val);
-                try out.append(self.allocator, try self.dup(.{ .name = name, .value = val }));
-                self.allocator.free(name);
-                self.allocator.free(val);
+                const copy = try self.dup(.{ .name = name, .value = val });
+                errdefer {
+                    self.allocator.free(copy.name);
+                    self.allocator.free(copy.value);
+                }
+                try out.append(self.allocator, copy);
             } else if (b & 0xe0 == 0x20) {
                 const size, const n = try readInteger(src, i, 5);
                 i = n;
+                // Only at the start of a block, and never above what we
+                // advertised (RFC 7541 §4.2): otherwise the peer can grow our
+                // table without bound.
+                if (out.items.len != 0 or size > self.max_table_size) return error.HpackTableSize;
                 self.table_size = size;
                 self.evict();
             } else {
@@ -155,6 +171,10 @@ pub const Decoder = struct {
                 i = n;
                 const name, const val, const n2 = try self.readNameValue(src, i, idx);
                 i = n2;
+                errdefer {
+                    self.allocator.free(name);
+                    self.allocator.free(val);
+                }
                 try out.append(self.allocator, .{ .name = name, .value = val });
             }
         }
@@ -205,10 +225,9 @@ pub const Decoder = struct {
     }
 
     fn dup(self: *Decoder, h: Header) !Header {
-        return .{
-            .name = try self.allocator.dupe(u8, h.name),
-            .value = try self.allocator.dupe(u8, h.value),
-        };
+        const name = try self.allocator.dupe(u8, h.name);
+        errdefer self.allocator.free(name);
+        return .{ .name = name, .value = try self.allocator.dupe(u8, h.value) };
     }
 };
 

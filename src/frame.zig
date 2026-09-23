@@ -50,14 +50,15 @@ pub fn write(w: *std.Io.Writer, f: Frame) !void {
 }
 
 pub fn read(r: *std.Io.Reader, buf: []u8) !Frame {
-    const hdr = try r.takeArray(9);
+    // A payload read may rebase the reader, invalidating a borrowed header.
+    var hdr: [9]u8 = undefined;
+    try r.readSliceAll(&hdr);
     const len: usize = (@as(usize, hdr[0]) << 16) | (@as(usize, hdr[1]) << 8) | hdr[2];
     const stream_id: u31 = @truncate(((@as(u32, hdr[5]) << 24) | (@as(u32, hdr[6]) << 16) | (@as(u32, hdr[7]) << 8) | hdr[8]) & 0x7fff_ffff);
     if (len > buf.len) return error.FrameTooLarge;
-    if (len > 0) {
-        const got = try r.take(len);
-        @memcpy(buf[0..len], got);
-    }
+    // TLS readers buffer a record, not an entire HTTP/2 frame. Drain partial
+    // records into the caller's storage before asking TLS to decode another.
+    try r.readSliceAll(buf[0..len]);
     return .{
         .typ = @enumFromInt(hdr[3]),
         .flags = hdr[4],
@@ -82,4 +83,73 @@ test "frame SETTINGS empty roundtrip" {
 
 test "preface is 24 bytes" {
     try std.testing.expectEqual(@as(usize, 24), preface.len);
+}
+
+const RecordReader = struct {
+    interface: std.Io.Reader = undefined,
+    bytes: []const u8,
+    buffer: [32]u8 = undefined,
+
+    fn init(self: *@This(), bytes: []const u8) void {
+        self.bytes = bytes;
+        self.interface = .{ .vtable = &.{ .stream = stream }, .buffer = &self.buffer, .seek = 0, .end = 0 };
+    }
+
+    fn stream(r: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *@This() = @fieldParentPtr("interface", r);
+        if (self.bytes.len == 0) return error.EndOfStream;
+        const n = @min(self.buffer.len, self.bytes.len);
+        const pending = r.buffered();
+        // A record decoder cannot emit half of the next record. Return a
+        // test error where the TLS implementation asserts on insufficient room.
+        if (pending.len + n > r.buffer.len) return error.ReadFailed;
+        @memmove(r.buffer[0..pending.len], pending);
+        @memcpy(r.buffer[pending.len..][0..n], self.bytes[0..n]);
+        r.seek = 0;
+        r.end = pending.len + n;
+        self.bytes = self.bytes[n..];
+        return 0;
+    }
+};
+
+test "frames cross record boundaries without retaining TLS plaintext" {
+    var wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer wire.deinit();
+    const payload = "abcdefghijklmnopqrstuvwxyz012345";
+    for (0..2) |_| try write(&wire.writer, .{ .typ = .data, .flags = flags.end_stream, .stream_id = 3, .payload = payload });
+    var records: RecordReader = undefined;
+    records.init(wire.written());
+    var output: [32]u8 = undefined;
+    for (0..2) |_| {
+        const f = try read(&records.interface, &output);
+        try std.testing.expectEqual(Type.data, f.typ);
+        try std.testing.expectEqual(flags.end_stream, f.flags);
+        try std.testing.expectEqual(@as(u31, 3), f.stream_id);
+        try std.testing.expectEqualStrings(payload, f.payload);
+    }
+}
+
+test "frame payload can exceed the reader buffer and preserves the header" {
+    var wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer wire.deinit();
+    const payload: [96]u8 = @splat('z');
+    try write(&wire.writer, .{ .typ = .headers, .flags = flags.end_headers, .stream_id = 7, .payload = &payload });
+    var records: RecordReader = undefined;
+    records.init(wire.written());
+    var output: [96]u8 = undefined;
+    const f = try read(&records.interface, &output);
+    try std.testing.expectEqual(Type.headers, f.typ);
+    try std.testing.expectEqual(flags.end_headers, f.flags);
+    try std.testing.expectEqual(@as(u31, 7), f.stream_id);
+    try std.testing.expectEqualStrings(&payload, f.payload);
+}
+
+test "truncated frame payload still returns EndOfStream" {
+    var wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer wire.deinit();
+    try write(&wire.writer, .{ .typ = .data, .flags = 0, .stream_id = 1, .payload = "incomplete" });
+    var records: RecordReader = undefined;
+    records.init(wire.written()[0 .. wire.written().len - 1]);
+    var output: [32]u8 = undefined;
+    try std.testing.expectError(error.EndOfStream, read(&records.interface, &output));
 }

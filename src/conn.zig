@@ -2,6 +2,34 @@
 const std = @import("std");
 const frame = @import("frame.zig");
 const hpack = @import("hpack.zig");
+const flow_mod = @import("flow.zig");
+
+/// Frames read while waiting for outbound credit before giving up on the peer.
+const max_credit_frames: u32 = 64;
+
+/// Header block (HEADERS + CONTINUATION) cap: stops an endless CONTINUATION
+/// run from growing memory (RFC 9113 §10.5.1).
+pub const max_header_block: usize = 256 * 1024;
+
+/// RST_STREAM / GOAWAY error codes this client acts on (RFC 9113 §7).
+const err_no_error: u32 = 0x0;
+const err_refused_stream: u32 = 0x7;
+
+fn errorCode(f: frame.Frame) u32 {
+    if (f.payload.len < 4) return 0xffff_ffff;
+    return std.mem.readInt(u32, f.payload[0..4], .big);
+}
+
+/// Map RST_STREAM on our stream to an error. REFUSED_STREAM means the server
+/// did no work (RFC 9113 §8.7), so the caller may safely resend.
+fn rstError(f: frame.Frame) anyerror {
+    return if (errorCode(f) == err_refused_stream) error.StreamRefused else error.RstStream;
+}
+
+fn appendBlock(block: *std.ArrayList(u8), gpa: std.mem.Allocator, part: []const u8) !void {
+    if (block.items.len + part.len > max_header_block) return error.HeaderBlockTooLarge;
+    try block.appendSlice(gpa, part);
+}
 
 pub const Request = struct {
     method: []const u8,
@@ -28,7 +56,11 @@ pub const Response = struct {
     }
 };
 
-fn stripFramePayload(flags: u8, payload: []const u8) ![]const u8 {
+/// Drop padding (DATA, HEADERS, PUSH_PROMISE) and the priority block (HEADERS
+/// only). Flags a frame type does not define are ignored (RFC 9113 §4.1): on
+/// DATA 0x20 is not PRIORITY, and CONTINUATION carries neither.
+fn stripFramePayload(typ: frame.Type, flags: u8, payload: []const u8) ![]const u8 {
+    if (typ == .continuation) return payload;
     var p = payload;
     if (flags & frame.flags.padded != 0) {
         if (p.len == 0) return error.ShortFrame;
@@ -37,7 +69,7 @@ fn stripFramePayload(flags: u8, payload: []const u8) ![]const u8 {
         if (p.len < pad) return error.ShortFrame;
         p = p[0 .. p.len - pad];
     }
-    if (flags & frame.flags.priority != 0) {
+    if (typ == .headers and flags & frame.flags.priority != 0) {
         if (p.len < 5) return error.ShortFrame;
         p = p[5..];
     }
@@ -79,14 +111,7 @@ pub const LineStream = struct {
     }
 
     fn decodeBlock(self: *LineStream, block: []const u8) !void {
-        const decoded = try self.conn.decoder.decode(block);
-        defer self.conn.allocator.free(decoded);
-        for (decoded) |h| {
-            if (std.mem.eql(u8, h.name, ":status")) {
-                self.status = std.fmt.parseInt(u16, h.value, 10) catch 0;
-            }
-            try self.headers.append(self.conn.allocator, h);
-        }
+        self.status = try self.conn.decodeInto(&self.headers, block) orelse self.status;
     }
 
     /// True when a line (without LF) was written to `dest`. False at END_STREAM.
@@ -110,30 +135,29 @@ pub const LineStream = struct {
     }
 
     fn pull(self: *LineStream) !void {
-        const f = try frame.read(self.conn.reader, &self.conn.buf);
+        // readFrame absorbs SETTINGS/PING/WINDOW_UPDATE/PRIORITY, so only the
+        // frames this stream must act on arrive here.
+        const f = try self.conn.readFrame();
         switch (f.typ) {
-            .settings => {
-                if (f.flags & frame.flags.ack == 0) {
-                    try frame.write(self.conn.writer, .{ .typ = .settings, .flags = frame.flags.ack, .stream_id = 0, .payload = &.{} });
-                    try self.conn.writer.flush();
+            .goaway => try self.conn.onGoAway(f, self.sid),
+            .rst_stream => if (f.stream_id == self.sid) {
+                // A complete response followed by RST_STREAM(NO_ERROR) is how a
+                // server stops an upload it no longer needs (RFC 9113 §8.1).
+                if (errorCode(f) == err_no_error and self.status != 0) {
+                    self.ended = true;
+                    return;
                 }
+                return rstError(f);
             },
-            .ping => {
-                try frame.write(self.conn.writer, .{ .typ = .ping, .flags = frame.flags.ack, .stream_id = 0, .payload = f.payload });
-                try self.conn.writer.flush();
-            },
-            .window_update, .priority => {},
-            .goaway => return error.GoAway,
-            .rst_stream => if (f.stream_id == self.sid) return error.RstStream,
             .headers => {
                 if (f.stream_id != self.sid) {
                     // Pushed / other-stream headers: decode to keep the
                     // HPACK table in sync, then ignore.
-                    const payload = try stripFramePayload(f.flags, f.payload);
+                    const payload = try stripFramePayload(f.typ, f.flags, f.payload);
                     try self.conn.discardBlock(payload, f.flags, f.stream_id);
                     return;
                 }
-                const payload = try stripFramePayload(f.flags, f.payload);
+                const payload = try stripFramePayload(f.typ, f.flags, f.payload);
                 if (f.flags & frame.flags.end_stream != 0) self.hdr_end_stream = true;
                 if (f.flags & frame.flags.end_headers != 0) {
                     try self.decodeBlock(payload);
@@ -145,16 +169,15 @@ pub const LineStream = struct {
                     // arrives. Decoding fragments separately desyncs the
                     // HPACK dynamic table (HpackIndex on reuse).
                     self.hdr_block.clearRetainingCapacity();
-                    try self.hdr_block.appendSlice(self.conn.allocator, payload);
+                    try appendBlock(&self.hdr_block, self.conn.allocator, payload);
                     self.hdr_open = true;
                 }
             },
             .continuation => {
                 if (f.stream_id == self.sid) {
                     if (!self.hdr_open) return error.HpackTruncated;
-                    const payload = try stripFramePayload(f.flags, f.payload);
-                    if (f.flags & frame.flags.end_stream != 0) self.hdr_end_stream = true;
-                    try self.hdr_block.appendSlice(self.conn.allocator, payload);
+                    // END_STREAM rides on the HEADERS frame, never CONTINUATION.
+                    try appendBlock(&self.hdr_block, self.conn.allocator, f.payload);
                     if (f.flags & frame.flags.end_headers != 0) {
                         try self.decodeBlock(self.hdr_block.items);
                         self.hdr_block.clearRetainingCapacity();
@@ -171,14 +194,14 @@ pub const LineStream = struct {
             .push_promise => {
                 // Promised request headers are HPACK state too; decode and
                 // drop. Payload: 4-byte promised id + header block fragment.
-                const payload = try stripFramePayload(f.flags, f.payload);
+                const payload = try stripFramePayload(f.typ, f.flags, f.payload);
                 if (payload.len < 4) return error.HpackTruncated;
                 try self.conn.discardBlock(payload[4..], f.flags, f.stream_id);
             },
             .data => {
                 try self.conn.creditData(f.stream_id, f.payload.len);
                 if (f.stream_id != self.sid) return;
-                const payload = try stripFramePayload(f.flags, f.payload);
+                const payload = try stripFramePayload(f.typ, f.flags, f.payload);
                 try self.pending.appendSlice(self.conn.allocator, payload);
                 if (f.flags & frame.flags.end_stream != 0) self.ended = true;
             },
@@ -196,6 +219,14 @@ pub const Conn = struct {
     decoder: hpack.Decoder,
     encoder: hpack.Encoder,
     buf: [16384]u8 = undefined,
+    /// Outbound windows and the peer's SETTINGS (RFC 9113 5.2, 6.9).
+    flow: flow_mod.Flow = .{},
+    /// Frames read while draining for outbound credit mid-send. They belong to
+    /// the response, so readRaw replays them instead of dropping them.
+    pending_wire: std.ArrayList(u8) = .empty,
+    /// Last-stream-id from the peer's GOAWAY: the connection is draining and
+    /// takes no new streams (RFC 9113 §6.8).
+    goaway_last: ?u31 = null,
 
     pub fn init(allocator: std.mem.Allocator, reader: *std.Io.Reader, writer: *std.Io.Writer) Conn {
         return .{
@@ -209,6 +240,21 @@ pub const Conn = struct {
 
     pub fn deinit(self: *Conn) void {
         self.decoder.deinit();
+        self.pending_wire.deinit(self.allocator);
+    }
+
+    pub fn acceptsStreams(self: *const Conn) bool {
+        return self.goaway_last == null;
+    }
+
+    /// GOAWAY (RFC 9113 §6.8): a stream at or below last-stream-id may finish,
+    /// so keep reading it. Above it the server never processed the stream, so
+    /// error.GoAway means "safe to resend elsewhere".
+    fn onGoAway(self: *Conn, f: frame.Frame, sid: u31) !void {
+        if (f.payload.len < 8) return error.GoAway;
+        const last: u31 = @truncate(std.mem.readInt(u32, f.payload[0..4], .big) & 0x7fff_ffff);
+        self.goaway_last = if (self.goaway_last) |prev| @min(prev, last) else last;
+        if (sid > last) return error.GoAway;
     }
 
     pub fn preface(self: *Conn) !void {
@@ -225,8 +271,7 @@ pub const Conn = struct {
 
     pub fn request(self: *Conn, req: Request) !Response {
         if (!self.saw_preface) try self.preface();
-        const sid = self.next_stream;
-        self.next_stream += 2;
+        const sid = try self.allocStream();
         var hdrs: std.ArrayList(hpack.Header) = .empty;
         defer hdrs.deinit(self.allocator);
         try hdrs.append(self.allocator, .{ .name = ":method", .value = req.method });
@@ -238,11 +283,131 @@ pub const Conn = struct {
         defer self.allocator.free(packed_hdr);
         const hflags: u8 = frame.flags.end_headers | (if (req.body.len == 0) frame.flags.end_stream else 0);
         try frame.write(self.writer, .{ .typ = .headers, .flags = hflags, .stream_id = sid, .payload = packed_hdr });
-        if (req.body.len != 0) {
-            try frame.write(self.writer, .{ .typ = .data, .flags = frame.flags.end_stream, .stream_id = sid, .payload = req.body });
+        try self.sendBody(sid, req.body);
+        return self.readResponse(sid);
+    }
+
+    /// Client streams are odd and strictly increasing (RFC 9113 5.1.1), and the
+    /// id space is finite. Letting `next_stream` wrap would panic a `u31` add
+    /// mid-request; the caller needs a plain error so it can open a new
+    /// connection instead.
+    fn allocStream(self: *Conn) !u31 {
+        if (self.next_stream > std.math.maxInt(u31) - 1) return error.StreamIdsExhausted;
+        const sid = self.next_stream;
+        self.next_stream += 2;
+        self.flow.beginStream(sid);
+        return sid;
+    }
+
+    /// Send `body` as DATA (RFC 9113 6.1). Two rules a one-shot write breaks:
+    /// no frame may exceed SETTINGS_MAX_FRAME_SIZE (initial 16384 -- larger is a
+    /// FRAME_SIZE_ERROR connection error), and the total must fit both the
+    /// connection and the stream window (else FLOW_CONTROL_ERROR). Chunks that do
+    /// not fit yet wait for the peer's WINDOW_UPDATE.
+    fn sendBody(self: *Conn, sid: u31, body: []const u8) !void {
+        var off: usize = 0;
+        while (off < body.len) {
+            const n = self.flow.allowed();
+            if (n == 0) {
+                if (try self.awaitCredit(sid)) return;
+                continue;
+            }
+            const take = @min(n, body.len - off);
+            const last = off + take == body.len;
+            try frame.write(self.writer, .{ .typ = .data, .flags = if (last) frame.flags.end_stream else 0, .stream_id = sid, .payload = body[off..][0..take] });
+            try self.writer.flush();
+            self.flow.consume(take);
+            off += take;
         }
         try self.writer.flush();
-        return self.readResponse(sid);
+    }
+
+    /// Read frames until the outbound window reopens. A peer that never credits
+    /// must not hang the caller, so this gives up after max_credit_frames and
+    /// surfaces an error the caller can fall back from. Returns true when the
+    /// peer ended our stream with RST_STREAM(NO_ERROR) after answering early
+    /// (RFC 9113 §8.1): the upload stops and the stashed response is read.
+    fn awaitCredit(self: *Conn, sid: u31) !bool {
+        var attempts: u32 = 0;
+        while (self.flow.allowed() == 0) {
+            attempts += 1;
+            if (attempts > max_credit_frames) return error.FlowControlBlocked;
+            // Fresh wire frames only. A frame already sitting in the stash is
+            // response data waiting to be replayed: pulling it here just to
+            // stash it again spins on one frame and never reaches the credit.
+            const f = try frame.read(self.reader, &self.buf);
+            if (f.typ == .goaway) {
+                try self.onGoAway(f, sid);
+                continue;
+            }
+            if (f.typ == .rst_stream and f.stream_id == sid) {
+                if (errorCode(f) != err_no_error) return rstError(f);
+                try self.stashFrame(f);
+                return true;
+            }
+            if (!try self.absorb(f)) try self.stashFrame(f);
+        }
+        return false;
+    }
+
+    /// Keep a frame that arrived while we were still sending. Its payload points
+    /// into `buf`, which the next read would overwrite, so copy the wire bytes.
+    fn stashFrame(self: *Conn, f: frame.Frame) !void {
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try frame.write(&aw.writer, f);
+        try self.pending_wire.appendSlice(self.allocator, aw.written());
+    }
+
+    /// One raw frame, replaying anything stashed during a credit drain first.
+    fn readRaw(self: *Conn) !frame.Frame {
+        if (self.pending_wire.items.len == 0) return frame.read(self.reader, &self.buf);
+        var r: std.Io.Reader = .fixed(self.pending_wire.items);
+        const f = try frame.read(&r, &self.buf);
+        const used = 9 + f.payload.len;
+        std.mem.copyForwards(u8, self.pending_wire.items[0 .. self.pending_wire.items.len - used], self.pending_wire.items[used..]);
+        self.pending_wire.items.len -= used;
+        return f;
+    }
+
+    /// Absorb connection-level traffic: SETTINGS is parsed and ACKed (it carries
+    /// the windows and frame size this client sends under), PING is ACKed,
+    /// WINDOW_UPDATE opens the outbound windows. Returns false for frames a
+    /// stream has to act on. Centralised so no call site reimplements it, and a
+    /// peer's credit can never be mistaken for silence.
+    fn absorb(self: *Conn, f: frame.Frame) !bool {
+        switch (f.typ) {
+            .settings => {
+                if (f.flags & frame.flags.ack == 0) {
+                    try self.flow.onSettings(f.payload);
+                    try frame.write(self.writer, .{ .typ = .settings, .flags = frame.flags.ack, .stream_id = 0, .payload = &.{} });
+                    try self.writer.flush();
+                }
+            },
+            .ping => {
+                if (f.flags & frame.flags.ack == 0) {
+                    try frame.write(self.writer, .{ .typ = .ping, .flags = frame.flags.ack, .stream_id = 0, .payload = f.payload });
+                    try self.writer.flush();
+                }
+            },
+            .window_update => {
+                if (f.payload.len < 4) return error.FlowControlBadFrame;
+                // The high bit is reserved and must be ignored (RFC 9113 §6.9).
+                try self.flow.onWindowUpdate(f.stream_id, std.mem.readInt(u32, f.payload[0..4], .big) & 0x7fff_ffff);
+            },
+            .priority => {},
+            else => return false,
+        }
+        return true;
+    }
+
+    /// The next frame a stream must act on, with connection-level traffic
+    /// absorbed and anything stashed during a credit drain replayed first.
+    fn readFrame(self: *Conn) !frame.Frame {
+        while (true) {
+            const f = try self.readRaw();
+            if (!try self.absorb(f)) return f;
+        }
     }
 
     /// DATA counts against both the stream and connection windows (RFC 9113
@@ -278,13 +443,12 @@ pub const Conn = struct {
         }
         var acc: std.ArrayList(u8) = .empty;
         defer acc.deinit(self.allocator);
-        try acc.appendSlice(self.allocator, first);
+        try appendBlock(&acc, self.allocator, first);
         var fl = flags;
         while (fl & frame.flags.end_headers == 0) {
-            const c = try frame.read(self.reader, &self.buf);
+            const c = try self.readRaw(); // may already sit in the credit-drain stash
             if (c.typ != .continuation or c.stream_id != sid) return error.HpackTruncated;
-            const cp = try stripFramePayload(c.flags, c.payload);
-            try acc.appendSlice(self.allocator, cp);
+            try appendBlock(&acc, self.allocator, c.payload);
             fl = c.flags;
         }
         const dec = try self.decoder.decode(acc.items);
@@ -295,21 +459,37 @@ pub const Conn = struct {
         }
     }
 
-    fn decodeBlock(self: *Conn, headers: *std.ArrayList(hpack.Header), status: *u16, block: []const u8) !void {
+    /// Decode one response header block into `headers` and return its
+    /// :status. An interim 1xx block (100, 103 Early Hints) is decoded -- the
+    /// HPACK table must stay in sync -- and dropped, returning null: the final
+    /// response is still coming (RFC 9113 §8.1).
+    fn decodeInto(self: *Conn, headers: *std.ArrayList(hpack.Header), block: []const u8) !?u16 {
         const decoded = try self.decoder.decode(block);
         defer self.allocator.free(decoded);
+        var status: u16 = 0;
         for (decoded) |h| {
-            if (std.mem.eql(u8, h.name, ":status")) {
-                status.* = std.fmt.parseInt(u16, h.value, 10) catch 0;
-            }
-            try headers.append(self.allocator, h);
+            if (std.mem.eql(u8, h.name, ":status")) status = std.fmt.parseInt(u16, h.value, 10) catch 0;
         }
+        const interim = status >= 100 and status < 200;
+        var kept: usize = 0;
+        errdefer for (decoded[kept..]) |h| {
+            self.allocator.free(h.name);
+            self.allocator.free(h.value);
+        };
+        for (decoded) |h| {
+            if (interim) {
+                self.allocator.free(h.name);
+                self.allocator.free(h.value);
+            } else try headers.append(self.allocator, h);
+            kept += 1;
+        }
+        if (interim or status == 0) return null;
+        return status;
     }
 
     pub fn startLines(self: *Conn, req: Request) !LineStream {
         if (!self.saw_preface) try self.preface();
-        const sid = self.next_stream;
-        self.next_stream += 2;
+        const sid = try self.allocStream();
         var hdrs: std.ArrayList(hpack.Header) = .empty;
         defer hdrs.deinit(self.allocator);
         try hdrs.append(self.allocator, .{ .name = ":method", .value = req.method });
@@ -321,10 +501,7 @@ pub const Conn = struct {
         defer self.allocator.free(packed_hdr);
         const hflags: u8 = frame.flags.end_headers | (if (req.body.len == 0) frame.flags.end_stream else 0);
         try frame.write(self.writer, .{ .typ = .headers, .flags = hflags, .stream_id = sid, .payload = packed_hdr });
-        if (req.body.len != 0) {
-            try frame.write(self.writer, .{ .typ = .data, .flags = frame.flags.end_stream, .stream_id = sid, .payload = req.body });
-        }
-        try self.writer.flush();
+        try self.sendBody(sid, req.body);
         return .{
             .conn = self,
             .sid = sid,
@@ -346,33 +523,28 @@ pub const Conn = struct {
         errdefer body.deinit(self.allocator);
         var ended = false;
         while (!ended) {
-            const f = try frame.read(self.reader, &self.buf);
+            const f = try self.readFrame();
             switch (f.typ) {
-                .settings => {
-                    if (f.flags & frame.flags.ack == 0) {
-                        try frame.write(self.writer, .{ .typ = .settings, .flags = frame.flags.ack, .stream_id = 0, .payload = &.{} });
-                        try self.writer.flush();
+                .goaway => try self.onGoAway(f, sid),
+                .rst_stream => if (f.stream_id == sid) {
+                    if (errorCode(f) == err_no_error and status != 0) {
+                        ended = true;
+                        continue;
                     }
+                    return rstError(f);
                 },
-                .ping => {
-                    try frame.write(self.writer, .{ .typ = .ping, .flags = frame.flags.ack, .stream_id = 0, .payload = f.payload });
-                    try self.writer.flush();
-                },
-                .window_update, .priority => {},
-                .goaway => return error.GoAway,
-                .rst_stream => if (f.stream_id == sid) return error.RstStream,
                 .headers => {
                     if (f.stream_id != sid) {
                         // Pushed / other-stream headers: decode to keep the
                         // HPACK table in sync, then ignore.
-                        const payload = try stripFramePayload(f.flags, f.payload);
+                        const payload = try stripFramePayload(f.typ, f.flags, f.payload);
                         try self.discardBlock(payload, f.flags, f.stream_id);
                         continue;
                     }
-                    const payload = try stripFramePayload(f.flags, f.payload);
-                    var end_stream = f.flags & frame.flags.end_stream != 0;
+                    const payload = try stripFramePayload(f.typ, f.flags, f.payload);
+                    const end_stream = f.flags & frame.flags.end_stream != 0;
                     if (f.flags & frame.flags.end_headers != 0) {
-                        try decodeBlock(self, &headers, &status, payload);
+                        status = try self.decodeInto(&headers, payload) orelse status;
                     } else {
                         // Fragmented header block (RFC 7540 §4.3): HEADERS
                         // without END_HEADERS is followed by CONTINUATION
@@ -380,35 +552,20 @@ pub const Conn = struct {
                         // dynamic table desyncs (HpackIndex on reuse).
                         var hblock: std.ArrayList(u8) = .empty;
                         defer hblock.deinit(self.allocator);
-                        try hblock.appendSlice(self.allocator, payload);
+                        try appendBlock(&hblock, self.allocator, payload);
                         var hflags: u8 = f.flags;
                         while (hflags & frame.flags.end_headers == 0) {
-                            const c = try frame.read(self.reader, &self.buf);
+                            const c = try self.readFrame();
                             switch (c.typ) {
-                                .settings => {
-                                    if (c.flags & frame.flags.ack == 0) {
-                                        try frame.write(self.writer, .{ .typ = .settings, .flags = frame.flags.ack, .stream_id = 0, .payload = &.{} });
-                                        try self.writer.flush();
-                                    }
-                                },
-                                .ping => {
-                                    try frame.write(self.writer, .{ .typ = .ping, .flags = frame.flags.ack, .stream_id = 0, .payload = c.payload });
-                                    try self.writer.flush();
-                                },
-                                .window_update, .priority => {},
-                                .goaway => return error.GoAway,
-                                .rst_stream => if (c.stream_id == sid) return error.RstStream,
                                 .continuation => {
                                     if (c.stream_id != sid) return error.HpackTruncated;
-                                    const cp = try stripFramePayload(c.flags, c.payload);
-                                    try hblock.appendSlice(self.allocator, cp);
-                                    if (c.flags & frame.flags.end_stream != 0) end_stream = true;
+                                    try appendBlock(&hblock, self.allocator, c.payload);
                                     hflags = c.flags;
                                 },
                                 else => return error.HpackTruncated,
                             }
                         }
-                        try decodeBlock(self, &headers, &status, hblock.items);
+                        status = try self.decodeInto(&headers, hblock.items) orelse status;
                     }
                     if (end_stream) ended = true;
                 },
@@ -416,14 +573,14 @@ pub const Conn = struct {
                 .push_promise => {
                     // Promised request headers are HPACK state too; decode
                     // and drop. Payload: 4-byte promised id + fragment.
-                    const payload = try stripFramePayload(f.flags, f.payload);
+                    const payload = try stripFramePayload(f.typ, f.flags, f.payload);
                     if (payload.len < 4) return error.HpackTruncated;
                     try self.discardBlock(payload[4..], f.flags, f.stream_id);
                 },
                 .data => {
                     try self.creditData(f.stream_id, f.payload.len);
                     if (f.stream_id != sid) continue;
-                    const payload = try stripFramePayload(f.flags, f.payload);
+                    const payload = try stripFramePayload(f.typ, f.flags, f.payload);
                     try body.appendSlice(self.allocator, payload);
                     if (f.flags & frame.flags.end_stream != 0) ended = true;
                 },
@@ -438,171 +595,3 @@ pub const Conn = struct {
         };
     }
 };
-
-fn serverSettingsAckHeadersData() []const u8 {
-    return &dummy;
-}
-
-const dummy = blk: {
-    break :blk [_]u8{};
-};
-
-test "conn GET returns 200 ok" {
-    const gpa = std.testing.allocator;
-
-    // Server: SETTINGS, SETTINGS ACK, HEADERS :status 200 END_HEADERS, DATA "ok" END_STREAM
-    var srv_aw: std.Io.Writer.Allocating = .init(gpa);
-    defer srv_aw.deinit();
-    try frame.write(&srv_aw.writer, .{ .typ = .settings, .flags = 0, .stream_id = 0, .payload = &.{} });
-    try frame.write(&srv_aw.writer, .{ .typ = .settings, .flags = frame.flags.ack, .stream_id = 0, .payload = &.{} });
-    const status_hpack = [_]u8{0x88}; // indexed :status 200
-    try frame.write(&srv_aw.writer, .{ .typ = .headers, .flags = frame.flags.end_headers, .stream_id = 1, .payload = &status_hpack });
-    try frame.write(&srv_aw.writer, .{ .typ = .data, .flags = frame.flags.end_stream, .stream_id = 1, .payload = "ok" });
-    const server_bytes = try gpa.dupe(u8, srv_aw.written());
-    defer gpa.free(server_bytes);
-
-    var reader: std.Io.Reader = .fixed(server_bytes);
-    var client_aw: std.Io.Writer.Allocating = .init(gpa);
-    defer client_aw.deinit();
-
-    var c = Conn.init(gpa, &reader, &client_aw.writer);
-    defer c.deinit();
-    var res = try c.request(.{
-        .method = "GET",
-        .scheme = "http",
-        .authority = "localhost",
-        .path = "/",
-    });
-    defer res.deinit();
-    try std.testing.expectEqual(@as(u16, 200), res.status);
-    try std.testing.expectEqualStrings("ok", res.body);
-    try std.testing.expect(std.mem.eql(u8, client_aw.written()[0..frame.preface.len], frame.preface));
-}
-
-test "conn two sequential streams" {
-    const gpa = std.testing.allocator;
-    var srv_aw: std.Io.Writer.Allocating = .init(gpa);
-    defer srv_aw.deinit();
-    try frame.write(&srv_aw.writer, .{ .typ = .settings, .flags = 0, .stream_id = 0, .payload = &.{} });
-    try frame.write(&srv_aw.writer, .{ .typ = .settings, .flags = frame.flags.ack, .stream_id = 0, .payload = &.{} });
-    const status_hpack = [_]u8{0x88};
-    try frame.write(&srv_aw.writer, .{ .typ = .headers, .flags = frame.flags.end_headers, .stream_id = 1, .payload = &status_hpack });
-    try frame.write(&srv_aw.writer, .{ .typ = .data, .flags = frame.flags.end_stream, .stream_id = 1, .payload = "one" });
-    try frame.write(&srv_aw.writer, .{ .typ = .headers, .flags = frame.flags.end_headers, .stream_id = 3, .payload = &status_hpack });
-    try frame.write(&srv_aw.writer, .{ .typ = .data, .flags = frame.flags.end_stream, .stream_id = 3, .payload = "two" });
-    const server_bytes = try gpa.dupe(u8, srv_aw.written());
-    defer gpa.free(server_bytes);
-    var reader: std.Io.Reader = .fixed(server_bytes);
-    var client_aw: std.Io.Writer.Allocating = .init(gpa);
-    defer client_aw.deinit();
-    var c = Conn.init(gpa, &reader, &client_aw.writer);
-    defer c.deinit();
-    var a = try c.request(.{ .method = "GET", .scheme = "http", .authority = "localhost", .path = "/" });
-    defer a.deinit();
-    var b = try c.request(.{ .method = "GET", .scheme = "http", .authority = "localhost", .path = "/" });
-    defer b.deinit();
-    try std.testing.expectEqualStrings("one", a.body);
-    try std.testing.expectEqualStrings("two", b.body);
-    try std.testing.expectEqual(@as(u31, 5), c.next_stream);
-    // Each DATA frame is credited on the connection and the stream, or the
-    // peer stops after the initial 65535-byte window.
-    try std.testing.expectEqual(@as(usize, 4), countFrames(client_aw.written(), .window_update));
-}
-
-fn countFrames(bytes: []const u8, typ: frame.Type) usize {
-    var i: usize = 0;
-    if (std.mem.startsWith(u8, bytes, frame.preface)) i = frame.preface.len;
-    var n: usize = 0;
-    while (i + 9 <= bytes.len) {
-        const len = (@as(usize, bytes[i]) << 16) | (@as(usize, bytes[i + 1]) << 8) | bytes[i + 2];
-        if (i + 9 + len > bytes.len) break;
-        if (@as(frame.Type, @enumFromInt(bytes[i + 3])) == typ) n += 1;
-        i += 9 + len;
-    }
-    return n;
-}
-
-test "conn fragmented headers reassemble before HPACK decode" {
-    const gpa = std.testing.allocator;
-    // Header block with incremental indexing: :status 200 + x-test: hello.
-    // Split across HEADERS (no END_HEADERS) + CONTINUATION so a naive
-    // per-fragment decode desyncs the dynamic table (HpackIndex on reuse).
-    const block = [_]u8{
-        0x88, // :status 200
-        0x40, 0x06, 'x', '-', 't', 'e', 's', 't', // new name, incremental
-        0x05, 'h',  'e', 'l', 'l', 'o',
-    };
-    const split = 5;
-    var srv_aw: std.Io.Writer.Allocating = .init(gpa);
-    defer srv_aw.deinit();
-    try frame.write(&srv_aw.writer, .{ .typ = .settings, .flags = 0, .stream_id = 0, .payload = &.{} });
-    try frame.write(&srv_aw.writer, .{ .typ = .headers, .flags = 0, .stream_id = 1, .payload = block[0..split] });
-    try frame.write(&srv_aw.writer, .{ .typ = .continuation, .flags = frame.flags.end_headers, .stream_id = 1, .payload = block[split..] });
-    try frame.write(&srv_aw.writer, .{ .typ = .data, .flags = frame.flags.end_stream, .stream_id = 1, .payload = "ok" });
-    // Second response references the dynamic entry (index 62) added above.
-    const ref = [_]u8{ 0x88, 0xbe };
-    try frame.write(&srv_aw.writer, .{ .typ = .headers, .flags = frame.flags.end_headers, .stream_id = 3, .payload = &ref });
-    try frame.write(&srv_aw.writer, .{ .typ = .data, .flags = frame.flags.end_stream, .stream_id = 3, .payload = "two" });
-    const server_bytes = try gpa.dupe(u8, srv_aw.written());
-    defer gpa.free(server_bytes);
-    var reader: std.Io.Reader = .fixed(server_bytes);
-    var client_aw: std.Io.Writer.Allocating = .init(gpa);
-    defer client_aw.deinit();
-    var c = Conn.init(gpa, &reader, &client_aw.writer);
-    defer c.deinit();
-    var a = try c.request(.{ .method = "GET", .scheme = "http", .authority = "localhost", .path = "/" });
-    defer a.deinit();
-    try std.testing.expectEqual(@as(u16, 200), a.status);
-    try std.testing.expectEqualStrings("ok", a.body);
-    var b = try c.request(.{ .method = "GET", .scheme = "http", .authority = "localhost", .path = "/" });
-    defer b.deinit();
-    try std.testing.expectEqualStrings("two", b.body);
-    var found = false;
-    for (b.headers) |h| {
-        if (std.mem.eql(u8, h.name, "x-test") and std.mem.eql(u8, h.value, "hello")) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "conn server push keeps HPACK in sync" {
-    const gpa = std.testing.allocator;
-    // nghttp2.org pushes style.css: PUSH_PROMISE + pushed HEADERS both carry
-    // incremental entries. Skipping their decode desyncs the dynamic table
-    // and the next response fails with HpackIndex.
-    var srv_aw: std.Io.Writer.Allocating = .init(gpa);
-    defer srv_aw.deinit();
-    try frame.write(&srv_aw.writer, .{ .typ = .settings, .flags = 0, .stream_id = 0, .payload = &.{} });
-    // PUSH_PROMISE sid=1, promised 2: incremental x-req: r (adds index 62).
-    const promise = [_]u8{ 0, 0, 0, 2, 0x40, 0x05, 'x', '-', 'r', 'e', 'q', 0x01, 'r' };
-    try frame.write(&srv_aw.writer, .{ .typ = .push_promise, .flags = frame.flags.end_headers, .stream_id = 1, .payload = &promise });
-    // Main response headers sid=1: :status 200.
-    const status_hpack = [_]u8{0x88};
-    try frame.write(&srv_aw.writer, .{ .typ = .headers, .flags = frame.flags.end_headers, .stream_id = 1, .payload = &status_hpack });
-    // Pushed response HEADERS sid=2: :status 200 + incremental x-pushed: yes (adds 63).
-    const pushed = [_]u8{ 0x88, 0x40, 0x08, 'x', '-', 'p', 'u', 's', 'h', 'e', 'd', 0x03, 'y', 'e', 's' };
-    try frame.write(&srv_aw.writer, .{ .typ = .headers, .flags = frame.flags.end_headers, .stream_id = 2, .payload = &pushed });
-    try frame.write(&srv_aw.writer, .{ .typ = .data, .flags = frame.flags.end_stream, .stream_id = 2, .payload = "css" });
-    try frame.write(&srv_aw.writer, .{ .typ = .data, .flags = frame.flags.end_stream, .stream_id = 1, .payload = "ok" });
-    // Second response references the pushed entry (newest => index 62).
-    const ref = [_]u8{ 0x88, 0xbe };
-    try frame.write(&srv_aw.writer, .{ .typ = .headers, .flags = frame.flags.end_headers, .stream_id = 3, .payload = &ref });
-    try frame.write(&srv_aw.writer, .{ .typ = .data, .flags = frame.flags.end_stream, .stream_id = 3, .payload = "two" });
-    const server_bytes = try gpa.dupe(u8, srv_aw.written());
-    defer gpa.free(server_bytes);
-    var reader: std.Io.Reader = .fixed(server_bytes);
-    var client_aw: std.Io.Writer.Allocating = .init(gpa);
-    defer client_aw.deinit();
-    var c = Conn.init(gpa, &reader, &client_aw.writer);
-    defer c.deinit();
-    var a = try c.request(.{ .method = "GET", .scheme = "http", .authority = "localhost", .path = "/" });
-    defer a.deinit();
-    try std.testing.expectEqualStrings("ok", a.body);
-    var b = try c.request(.{ .method = "GET", .scheme = "http", .authority = "localhost", .path = "/" });
-    defer b.deinit();
-    try std.testing.expectEqualStrings("two", b.body);
-    var found = false;
-    for (b.headers) |h| {
-        if (std.mem.eql(u8, h.name, "x-pushed") and std.mem.eql(u8, h.value, "yes")) found = true;
-    }
-    try std.testing.expect(found);
-}
