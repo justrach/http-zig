@@ -134,6 +134,19 @@ pub const LineStream = struct {
         }
     }
 
+    /// Copy raw DATA bytes without waiting for a newline. A caller can bound
+    /// its response before appending; this stream retains at most one DATA
+    /// frame while used through readChunk alone. Zero means END_STREAM.
+    pub fn readChunk(self: *LineStream, dest: []u8) !usize {
+        if (dest.len == 0) return error.EmptyBuffer;
+        while (self.pending.items.len == 0 and !self.ended) try self.pull();
+        const n = @min(dest.len, self.pending.items.len);
+        @memcpy(dest[0..n], self.pending.items[0..n]);
+        std.mem.copyForwards(u8, self.pending.items[0 .. self.pending.items.len - n], self.pending.items[n..]);
+        self.pending.items.len -= n;
+        return n;
+    }
+
     fn pull(self: *LineStream) !void {
         // readFrame absorbs SETTINGS/PING/WINDOW_UPDATE/PRIORITY, so only the
         // frames this stream must act on arrive here.
@@ -201,6 +214,7 @@ pub const LineStream = struct {
             .data => {
                 try self.conn.creditData(f.stream_id, f.payload.len);
                 if (f.stream_id != self.sid) return;
+                if (self.status == 0) return error.DataBeforeHeaders;
                 const payload = try stripFramePayload(f.typ, f.flags, f.payload);
                 try self.pending.appendSlice(self.conn.allocator, payload);
                 if (f.flags & frame.flags.end_stream != 0) self.ended = true;

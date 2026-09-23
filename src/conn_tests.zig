@@ -47,6 +47,53 @@ test "conn GET returns 200 ok" {
     try std.testing.expect(std.mem.eql(u8, client_aw.written()[0..frame.preface.len], frame.preface));
 }
 
+test "raw chunks preserve newline-free DATA across frames and END_STREAM" {
+    const gpa = std.testing.allocator;
+    var srv: std.Io.Writer.Allocating = .init(gpa);
+    defer srv.deinit();
+    try frame.write(&srv.writer, .{ .typ = .settings, .flags = 0, .stream_id = 0, .payload = &.{} });
+    const status_hpack = [_]u8{0x88};
+    try frame.write(&srv.writer, .{ .typ = .headers, .flags = frame.flags.end_headers, .stream_id = 1, .payload = &status_hpack });
+    try frame.write(&srv.writer, .{ .typ = .data, .flags = 0, .stream_id = 1, .payload = "ab" });
+    try frame.write(&srv.writer, .{ .typ = .data, .flags = frame.flags.end_stream, .stream_id = 1, .payload = "cdef" });
+    var reader: std.Io.Reader = .fixed(srv.written());
+    var client: std.Io.Writer.Allocating = .init(gpa);
+    defer client.deinit();
+    var conn = Conn.init(gpa, &reader, &client.writer);
+    defer conn.deinit();
+    var stream = try conn.startLines(.{ .method = "GET", .scheme = "https", .authority = "localhost", .path = "/" });
+    defer stream.deinit();
+    try std.testing.expectEqual(@as(u16, 200), try stream.waitStatus());
+    var buf: [3]u8 = undefined;
+    try std.testing.expectError(error.EmptyBuffer, stream.readChunk(&.{}));
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    while (true) {
+        const n = try stream.readChunk(&buf);
+        if (n == 0) break;
+        try body.appendSlice(gpa, buf[0..n]);
+    }
+    try std.testing.expectEqualStrings("abcdef", body.items);
+    try std.testing.expect(stream.ended);
+    try std.testing.expectEqual(@as(usize, 4), countFrames(client.written(), .window_update));
+}
+
+test "raw chunk stream rejects DATA before response headers" {
+    const gpa = std.testing.allocator;
+    var srv: std.Io.Writer.Allocating = .init(gpa);
+    defer srv.deinit();
+    try frame.write(&srv.writer, .{ .typ = .settings, .flags = 0, .stream_id = 0, .payload = &.{} });
+    try frame.write(&srv.writer, .{ .typ = .data, .flags = frame.flags.end_stream, .stream_id = 1, .payload = "unexpected" });
+    var reader: std.Io.Reader = .fixed(srv.written());
+    var client: std.Io.Writer.Allocating = .init(gpa);
+    defer client.deinit();
+    var conn = Conn.init(gpa, &reader, &client.writer);
+    defer conn.deinit();
+    var stream = try conn.startLines(.{ .method = "GET", .scheme = "https", .authority = "localhost", .path = "/" });
+    defer stream.deinit();
+    try std.testing.expectError(error.DataBeforeHeaders, stream.waitStatus());
+}
+
 test "conn two sequential streams" {
     const gpa = std.testing.allocator;
     var srv_aw: std.Io.Writer.Allocating = .init(gpa);
