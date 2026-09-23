@@ -1,6 +1,6 @@
 //! One HTTPS origin: HTTP/2 connection reuse (odd stream ids) with a
-//! first-failure latch onto `std.http.Client` (HTTP/1.1), same shape as
-//! grok-build's h2 → http1_only rebuild.
+//! handshake fallback onto `std.http.Client` (HTTP/1.1). Ambiguous request
+//! failures return to the caller rather than silently replaying a body.
 
 const std = @import("std");
 const Io = std.Io;
@@ -65,30 +65,36 @@ pub const Session = struct {
 
     pub fn request(self: *Session, req: Request) !Response {
         if (self.h1_only) return requestH1(self.gpa, self.io, req, self.host, self.port);
-        return self.requestH2(req) catch |err| {
-            if (err == error.EndOfStream or err == error.GoAway) {
-                self.teardownH2();
-                self.h1_only = false;
-                self.dialH2() catch {
-                    self.h1_only = true;
-                    return requestH1(self.gpa, self.io, req, self.host, self.port);
-                };
-                return self.requestH2(req) catch |e2| {
-                    if (!transportFallback(e2)) return e2;
-                    self.teardownH2();
-                    self.h1_only = true;
-                    return requestH1(self.gpa, self.io, req, self.host, self.port);
-                };
-            }
-            if (!transportFallback(err)) return err;
+        // A previous failed request tears down the connection. Redial before
+        // touching Conn again, including when a caller reuses this Session.
+        if (!self.h2_live or !self.conn.acceptsStreams()) {
             self.teardownH2();
-            self.h1_only = true;
-            return requestH1(self.gpa, self.io, req, self.host, self.port);
+            self.dialH2() catch |err| {
+                self.teardownH2();
+                if (!handshakeFallback(err)) return err;
+                self.h1_only = true;
+                return requestH1(self.gpa, self.io, req, self.host, self.port);
+            };
+        }
+        return self.requestH2(req) catch |err| {
+            self.teardownH2();
+            // Only these responses prove the peer did not process this stream.
+            // EOF, RST_STREAM and framing/TLS failures can follow a complete
+            // request, so never replay them inside the transport.
+            if (!safeReplay(err)) return err;
+            self.dialH2() catch |dial_err| {
+                self.teardownH2();
+                return dial_err;
+            };
+            return self.requestH2(req) catch |second| {
+                self.teardownH2();
+                return second;
+            };
         };
     }
 
-    /// Streaming DATA as lines (SSE). Same redial as `request`: a dead h2
-    /// connection is dialed again before latching HTTP/1.1.
+    /// Streaming DATA as lines (SSE). The caller decides how to recover from
+    /// a failed request; this transport never silently replays a sent body.
     pub fn startLines(self: *Session, req: Request) !LineStream {
         if (self.h1_only) return error.H1NoStream;
         // A connection the peer is draining (GOAWAY seen on an earlier stream)
@@ -104,23 +110,8 @@ pub const Session = struct {
             };
         }
         return self.conn.startLines(req) catch |err| {
-            if (err == error.EndOfStream or err == error.GoAway) {
-                self.teardownH2();
-                self.dialH2() catch {
-                    self.h1_only = true;
-                    return error.H1NoStream;
-                };
-                return self.conn.startLines(req) catch |e2| {
-                    if (!transportFallback(e2)) return e2;
-                    self.teardownH2();
-                    self.h1_only = true;
-                    return error.H1NoStream;
-                };
-            }
-            if (!transportFallback(err)) return err;
             self.teardownH2();
-            self.h1_only = true;
-            return error.H1NoStream;
+            return err;
         };
     }
 
@@ -230,6 +221,12 @@ pub fn handshakeFallback(err: anyerror) bool {
     };
 }
 
+pub fn safeReplay(err: anyerror) bool {
+    return err == error.GoAway or err == error.StreamRefused;
+}
+
+/// Legacy transport-error classifier. It is not a replay authorization:
+/// several of these errors can occur after the peer received a full request.
 pub fn transportFallback(err: anyerror) bool {
     return handshakeFallback(err) or switch (err) {
         error.GoAway, error.StreamRefused, error.RstStream, error.FrameTooLarge, error.HpackIndex, error.HpackTruncated, error.EndOfStream => true,
@@ -263,6 +260,9 @@ pub fn requestH1(gpa: std.mem.Allocator, io: Io, req: Request, host: []const u8,
 test "handshakeFallback is TlsAlert not OOM" {
     try std.testing.expect(handshakeFallback(error.TlsAlert));
     try std.testing.expect(!handshakeFallback(error.OutOfMemory));
-    try std.testing.expect(transportFallback(error.GoAway));
-    try std.testing.expect(!transportFallback(error.OutOfMemory));
+    try std.testing.expect(safeReplay(error.GoAway));
+    try std.testing.expect(safeReplay(error.StreamRefused));
+    try std.testing.expect(!safeReplay(error.EndOfStream));
+    try std.testing.expect(!safeReplay(error.RstStream));
+    try std.testing.expect(!safeReplay(error.OutOfMemory));
 }
