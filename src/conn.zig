@@ -251,10 +251,10 @@ pub const Conn = struct {
     /// so keep reading it. Above it the server never processed the stream, so
     /// error.GoAway means "safe to resend elsewhere".
     fn onGoAway(self: *Conn, f: frame.Frame, sid: u31) !void {
-        if (f.payload.len < 8) return error.GoAway;
+        if (f.payload.len < 8) return error.InvalidGoAway;
         const last: u31 = @truncate(std.mem.readInt(u32, f.payload[0..4], .big) & 0x7fff_ffff);
         self.goaway_last = if (self.goaway_last) |prev| @min(prev, last) else last;
-        if (sid > last) return error.GoAway;
+        if (sid > self.goaway_last.?) return error.GoAway;
     }
 
     pub fn preface(self: *Conn) !void {
