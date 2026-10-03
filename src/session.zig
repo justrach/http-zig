@@ -250,7 +250,7 @@ pub fn requestH1(gpa: std.mem.Allocator, io: Io, req: Request, host: []const u8,
     });
     const headers = try gpa.alloc(hpack.Header, 0);
     return .{
-        .status = @intFromEnum(result.status),
+        .status = @backingInt(result.status),
         .headers = headers,
         .body = try aw.toOwnedSlice(),
         .allocator = gpa,

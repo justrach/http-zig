@@ -131,7 +131,7 @@ fn countFrames(bytes: []const u8, typ: frame.Type) usize {
     while (i + 9 <= bytes.len) {
         const len = (@as(usize, bytes[i]) << 16) | (@as(usize, bytes[i + 1]) << 8) | bytes[i + 2];
         if (i + 9 + len > bytes.len) break;
-        if (@as(frame.Type, @enumFromInt(bytes[i + 3])) == typ) n += 1;
+        if (@as(frame.Type, @fromBackingInt(@intCast(bytes[i + 3]))) == typ) n += 1;
         i += 9 + len;
     }
     return n;
@@ -233,7 +233,7 @@ fn scanData(gpa: std.mem.Allocator, written: []const u8, out: *std.ArrayList(u8)
     while (i + 9 <= written.len) {
         const len = (@as(usize, written[i]) << 16) | (@as(usize, written[i + 1]) << 8) | written[i + 2];
         if (i + 9 + len > written.len) break;
-        if (@as(frame.Type, @enumFromInt(written[i + 3])) == .data) {
+        if (@as(frame.Type, @fromBackingInt(@intCast(written[i + 3]))) == .data) {
             frames += 1;
             if (len > biggest) biggest = len;
             if (written[i + 4] & frame.flags.end_stream != 0) end_stream_frame = frames;
