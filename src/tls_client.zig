@@ -246,16 +246,16 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
     })) ++ tls.extension(.application_layer_protocol_negotiation, int(u16, 3) ++ [_]u8{ 2, 'h', '2' }) ++ tls.extension(.key_share, array(
         u16,
         u8,
-        int(u16, @intFromEnum(tls.NamedGroup.x25519_ml_kem768)) ++
+        int(u16, @backingInt(tls.NamedGroup.x25519_ml_kem768)) ++
             array(u16, u8, key_share.ml_kem768_kp.public_key.toBytes() ++ key_share.x25519_kp.public_key) ++
-            int(u16, @intFromEnum(tls.NamedGroup.secp256r1)) ++
+            int(u16, @backingInt(tls.NamedGroup.secp256r1)) ++
             array(u16, u8, key_share.secp256r1_kp.public_key.toUncompressedSec1()) ++
-            int(u16, @intFromEnum(tls.NamedGroup.secp384r1)) ++
+            int(u16, @backingInt(tls.NamedGroup.secp384r1)) ++
             array(u16, u8, key_share.secp384r1_kp.public_key.toUncompressedSec1()) ++
-            int(u16, @intFromEnum(tls.NamedGroup.x25519)) ++
+            int(u16, @backingInt(tls.NamedGroup.x25519)) ++
             array(u16, u8, key_share.x25519_kp.public_key),
     ));
-    const server_name_extension = int(u16, @intFromEnum(tls.ExtensionType.server_name)) ++
+    const server_name_extension = int(u16, @backingInt(tls.ExtensionType.server_name)) ++
         int(u16, 2 + 1 + 2 + host_len) ++ // byte length of this extension payload
         int(u16, 1 + 2 + host_len) ++ // server_name_list byte count
         .{0x00} ++ // name_type
@@ -271,19 +271,19 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
         server_name_extension;
 
     const client_hello =
-        int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+        int(u16, @backingInt(tls.ProtocolVersion.tls_1_2)) ++
         client_hello_rand ++
         [1]u8{32} ++ legacy_session_id ++
         cipher_suites ++
         array(u8, tls.CompressionMethod, .{.null}) ++
         extensions_header;
 
-    const out_handshake = .{@intFromEnum(tls.HandshakeType.client_hello)} ++
+    const out_handshake = .{@backingInt(tls.HandshakeType.client_hello)} ++
         int(u24, @intCast(client_hello.len - server_name_extension.len + server_name_extension_len)) ++
         client_hello;
 
-    const cleartext_header_buf = .{@intFromEnum(tls.ContentType.handshake)} ++
-        int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_0)) ++
+    const cleartext_header_buf = .{@backingInt(tls.ContentType.handshake)} ++
+        int(u16, @backingInt(tls.ProtocolVersion.tls_1_0)) ++
         int(u16, @intCast(out_handshake.len - server_name_extension.len + server_name_extension_len)) ++
         out_handshake;
     const cleartext_header = switch (options.host) {
@@ -399,7 +399,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                 }
                 read_seq += 1;
                 cleartext_fragment_end -= 1;
-                const ct: tls.ContentType = @enumFromInt(cleartext_buf[cleartext_fragment_end]);
+                const ct: tls.ContentType = @fromBackingInt(@intCast(cleartext_buf[cleartext_fragment_end]));
                 if (ct != .handshake) return error.TlsUnexpectedMessage;
                 break :content .{ tls.Decoder.fromTheirSlice(@constCast(cleartext_buf[cleartext_fragment_start..cleartext_fragment_end])), ct };
             },
@@ -507,7 +507,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             }
                         }
 
-                        tls_version = @enumFromInt(supported_version orelse legacy_version);
+                        tls_version = @fromBackingInt(@intCast(supported_version orelse legacy_version));
                         switch (tls_version) {
                             .tls_1_3 => if (!mem.eql(u8, legacy_session_id_echo, &legacy_session_id)) return error.TlsIllegalParameter,
                             .tls_1_2 => if (mem.eql(u8, server_hello_rand[24..31], "DOWNGRD") and
@@ -751,14 +751,14 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             else => return error.TlsIllegalParameter,
                         };
 
-                        const client_key_exchange_prefix = .{@intFromEnum(tls.ContentType.handshake)} ++
-                            int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                        const client_key_exchange_prefix = .{@backingInt(tls.ContentType.handshake)} ++
+                            int(u16, @backingInt(tls.ProtocolVersion.tls_1_2)) ++
                             int(u16, @intCast(public_key_bytes.len + 5)) ++ // record length
-                            .{@intFromEnum(tls.HandshakeType.client_key_exchange)} ++
+                            .{@backingInt(tls.HandshakeType.client_key_exchange)} ++
                             int(u24, @intCast(public_key_bytes.len + 1)) ++ // handshake message length
                             .{@as(u8, @intCast(public_key_bytes.len))}; // public key length
-                        const client_change_cipher_spec_msg = .{@intFromEnum(tls.ContentType.change_cipher_spec)} ++
-                            int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                        const client_change_cipher_spec_msg = .{@backingInt(tls.ContentType.change_cipher_spec)} ++
+                            int(u16, @backingInt(tls.ProtocolVersion.tls_1_2)) ++
                             array(u16, tls.ChangeCipherSpecType, .{.change_cipher_spec});
                         const pre_master_secret = key_share.getSharedSecret().?;
                         switch (handshake_cipher) {
@@ -783,7 +783,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     &.{ "key expansion", &server_hello_rand, &client_hello_rand },
                                     @sizeOf(P.Tls_1_2),
                                 );
-                                const client_verify_cleartext = .{@intFromEnum(tls.HandshakeType.finished)} ++
+                                const client_verify_cleartext = .{@backingInt(tls.HandshakeType.finished)} ++
                                     array(u24, u8, hmacExpandLabel(
                                         P.Hmac,
                                         &master_secret,
@@ -807,8 +807,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     const operand: V = pad ++ @as([8]u8, @bitCast(big(write_seq)));
                                     break :nonce @as(V, pv.app_cipher.client_write_IV ++ pv.app_cipher.client_salt) ^ operand;
                                 };
-                                var client_verify_msg = .{@intFromEnum(tls.ContentType.handshake)} ++
-                                    int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                                var client_verify_msg = .{@backingInt(tls.ContentType.handshake)} ++
+                                    int(u16, @backingInt(tls.ProtocolVersion.tls_1_2)) ++
                                     array(u16, u8, nonce[P.fixed_iv_length..].* ++
                                         @as([client_verify_cleartext.len + P.mac_length]u8, undefined));
                                 P.AEAD.encrypt(
@@ -858,8 +858,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         if (cipher_state == .cleartext) return error.TlsUnexpectedMessage;
                         if (handshake_state != .finished) return error.TlsUnexpectedMessage;
                         // This message is to trick buggy proxies into behaving correctly.
-                        const client_change_cipher_spec_msg = .{@intFromEnum(tls.ContentType.change_cipher_spec)} ++
-                            int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                        const client_change_cipher_spec_msg = .{@backingInt(tls.ContentType.change_cipher_spec)} ++
+                            int(u16, @backingInt(tls.ProtocolVersion.tls_1_2)) ++
                             array(u16, tls.ChangeCipherSpecType, .{.change_cipher_spec});
                         const app_cipher = app_cipher: switch (handshake_cipher) {
                             inline else => |*p, tag| switch (tls_version) {
@@ -873,14 +873,14 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     if (!std.crypto.timing_safe.eql([P.Hmac.mac_length]u8, expected_server_verify_data, hsd.array(P.Hmac.mac_length).*)) return error.TlsDecryptError;
                                     const handshake_hash = p.transcript_hash.finalResult();
                                     const verify_data = tls.hmac(P.Hmac, &handshake_hash, pv.client_finished_key);
-                                    const out_cleartext = .{@intFromEnum(tls.HandshakeType.finished)} ++
+                                    const out_cleartext = .{@backingInt(tls.HandshakeType.finished)} ++
                                         array(u24, u8, verify_data) ++
-                                        .{@intFromEnum(tls.ContentType.handshake)};
+                                        .{@backingInt(tls.ContentType.handshake)};
 
                                     const wrapped_len = out_cleartext.len + P.AEAD.tag_length;
 
-                                    var finished_msg = .{@intFromEnum(tls.ContentType.application_data)} ++
-                                        int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                                    var finished_msg = .{@backingInt(tls.ContentType.application_data)} ++
+                                        int(u16, @backingInt(tls.ProtocolVersion.tls_1_2)) ++
                                         array(u16, u8, @as([wrapped_len]u8, undefined));
 
                                     const ad = finished_msg[0..tls.record_header_len];
@@ -1038,7 +1038,7 @@ fn flush(w: *Writer) Writer.Error!void {
 /// distinguish between a properly finished TLS session, or a truncation
 /// attack.
 fn sendKeyUpdateReply(c: *Client) Writer.Error!void {
-    const reply = [_]u8{ @intFromEnum(tls.HandshakeType.key_update), 0, 0, 1, @intFromEnum(tls.KeyUpdateRequest.update_not_requested) };
+    const reply = [_]u8{ @backingInt(tls.HandshakeType.key_update), 0, 0, 1, @backingInt(tls.KeyUpdateRequest.update_not_requested) };
     const output = c.output;
     const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
     const prepared = prepareCiphertextRecord(c, ciphertext_buf, &reply, .handshake);
@@ -1086,14 +1086,14 @@ fn prepareCiphertextRecord(
                     };
 
                     @memcpy(cleartext_buf[0..encrypted_content_len], bytes[bytes_i..][0..encrypted_content_len]);
-                    cleartext_buf[encrypted_content_len] = @intFromEnum(inner_content_type);
+                    cleartext_buf[encrypted_content_len] = @backingInt(inner_content_type);
                     bytes_i += encrypted_content_len;
                     const ciphertext_len = encrypted_content_len + 1;
                     const cleartext = cleartext_buf[0..ciphertext_len];
 
                     const ad = ciphertext_buf[ciphertext_end..][0..tls.record_header_len];
-                    ad.* = .{@intFromEnum(tls.ContentType.application_data)} ++
-                        int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                    ad.* = .{@backingInt(tls.ContentType.application_data)} ++
+                        int(u16, @backingInt(tls.ProtocolVersion.tls_1_2)) ++
                         int(u16, ciphertext_len + P.AEAD.tag_length);
                     ciphertext_end += ad.len;
                     const ciphertext = ciphertext_buf[ciphertext_end..][0..ciphertext_len];
@@ -1131,8 +1131,8 @@ fn prepareCiphertextRecord(
 
                     const record_header = ciphertext_buf[ciphertext_end..][0..tls.record_header_len];
                     ciphertext_end += tls.record_header_len;
-                    record_header.* = .{@intFromEnum(inner_content_type)} ++
-                        int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                    record_header.* = .{@backingInt(inner_content_type)} ++
+                        int(u16, @backingInt(tls.ProtocolVersion.tls_1_2)) ++
                         int(u16, P.record_iv_length + message_len + P.mac_length);
                     const ad = mem.toBytes(big(c.write_seq)) ++ record_header[0 .. 1 + 2] ++ int(u16, message_len);
                     const record_iv = ciphertext_buf[ciphertext_end..][0..P.record_iv_length];
@@ -1195,7 +1195,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
         },
         error.ReadFailed => |e| return e,
     };
-    const ct: tls.ContentType = @enumFromInt(record_header[0]);
+    const ct: tls.ContentType = @fromBackingInt(@intCast(record_header[0]));
     const legacy_version = mem.readInt(u16, record_header[1..][0..2], .big);
     _ = legacy_version;
     const record_len = mem.readInt(u16, record_header[3..][0..2], .big);
@@ -1232,7 +1232,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                 // TODO use scalar, non-slice version
                 const msg = mem.trimEnd(u8, cleartext, "\x00");
                 if (msg.len == 0) return failRead(c, error.TlsDecodeError);
-                break :cleartext .{ msg.len - 1, @enumFromInt(msg[msg.len - 1]) };
+                break :cleartext .{ msg.len - 1, @fromBackingInt(@intCast(msg[msg.len - 1])) };
             },
             .tls_1_2 => {
                 const pv = &p.tls_1_2;
@@ -1269,8 +1269,8 @@ fn readIndirect(c: *Client) Reader.Error!usize {
         .alert => {
             if (cleartext.len != 2) return failRead(c, error.TlsDecodeError);
             const alert: tls.Alert = .{
-                .level = @enumFromInt(cleartext[0]),
-                .description = @enumFromInt(cleartext[1]),
+                .level = @fromBackingInt(@intCast(cleartext[0])),
+                .description = @fromBackingInt(@intCast(cleartext[1])),
             };
             switch (alert.description) {
                 .close_notify => {
@@ -1291,7 +1291,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
             var ct_i: usize = 0;
             while (true) {
                 if (cleartext.len - ct_i < 4) return failRead(c, error.TlsBadLength);
-                const handshake_type: tls.HandshakeType = @enumFromInt(cleartext[ct_i]);
+                const handshake_type: tls.HandshakeType = @fromBackingInt(@intCast(cleartext[ct_i]));
                 ct_i += 1;
                 const handshake_len = mem.readInt(u24, cleartext[ct_i..][0..3], .big);
                 ct_i += 3;
@@ -1326,7 +1326,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                         }
                         c.read_seq = 0;
 
-                        switch (@as(tls.KeyUpdateRequest, @enumFromInt(handshake[0]))) {
+                        switch (@as(tls.KeyUpdateRequest, @fromBackingInt(@intCast(handshake[0])))) {
                             .update_requested => {
                                 // Answer under the old keys before rotating them,
                                 // or the server cannot decrypt anything we send
@@ -1419,7 +1419,7 @@ const KeyShare = struct {
             .ml_kem768_kp = try .generateDeterministic(seed[0..64].*),
             .secp256r1_kp = try .generateDeterministic(seed[64..96].*),
             .secp384r1_kp = try .generateDeterministic(seed[96..144].*),
-            .x25519_kp = try .generateDeterministic(seed[144..176].*),
+            .x25519_kp = .generateDeterministic(seed[144..176].*),
             .sk_buf = undefined,
             .sk_len = 0,
         };
@@ -1632,7 +1632,7 @@ const CertificatePublicKey = struct {
                     inline 128, 256, 384, 512 => |modulus_len| {
                         const key: PublicKey = try .fromBytes(exponent, modulus);
                         const sig = RsaSignature.fromBytes(modulus_len, encoded_sig);
-                        try RsaSignature.concatVerify(modulus_len, sig, msg, key, Hash);
+                        try RsaSignature.concatVerify(modulus_len, &sig, msg, key, Hash);
                     },
                     else => return error.TlsBadRsaSignatureBitCount,
                 }

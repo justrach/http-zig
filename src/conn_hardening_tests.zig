@@ -82,6 +82,36 @@ test "GOAWAY below our stream id is error.GoAway (unprocessed)" {
     try std.testing.expectError(error.GoAway, ls.waitStatus());
 }
 
+test "malformed GOAWAY cannot authorize replay" {
+    var p = Peer.init();
+    defer p.aw.deinit();
+    p.add(.goaway, 0, 0, &.{ 0, 0, 0, 0 });
+    var r: std.Io.Reader = .fixed(p.aw.written());
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var c = Conn.init(std.testing.allocator, &r, &out.writer);
+    defer c.deinit();
+    var ls = try c.startLines(get);
+    defer ls.deinit();
+    try std.testing.expectError(error.InvalidGoAway, ls.waitStatus());
+}
+
+test "later GOAWAY cannot raise last accepted stream" {
+    var p = Peer.init();
+    defer p.aw.deinit();
+    p.goaway(5, 0);
+    var r: std.Io.Reader = .fixed(p.aw.written());
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var c = Conn.init(std.testing.allocator, &r, &out.writer);
+    defer c.deinit();
+    c.goaway_last = 1; // Earlier GOAWAY already excluded stream 3.
+    c.next_stream = 3;
+    var ls = try c.startLines(get);
+    defer ls.deinit();
+    try std.testing.expectError(error.GoAway, ls.waitStatus());
+}
+
 test "103 Early Hints is skipped; the final status is returned" {
     var p = Peer.init();
     defer p.aw.deinit();

@@ -18,12 +18,19 @@ var res = try s.request(.{ .method = "GET", .scheme = "https", .authority = "ngh
 | Piece | Status |
 |---|---|
 | Sequential streams on one connection | yes (odd ids) |
-| Peer close / GOAWAY | redial h2, then HTTP/1.1 |
+| Peer close between requests | redial h2 before the next request |
+| Current stream above GOAWAY's last-stream-ID / REFUSED_STREAM | safe resend (the peer did not process it) |
+| Error after a request may have been sent | return the error; caller decides whether to retry |
 | First TLS/ALPN failure | latch `std.http.Client` |
 | SSE line stream | `Session.startLines` |
 | HTTPS ALPN `h2` | `src/tls_client.zig` (Zig std TLS + ALPN) |
 
 `GRAFF_HTTP2=0` in graff opts out. This crate always prefers h2.
+
+`Session.startLines` never replays a request body after a send error. It returns
+the error to its caller. `Session.request` retries only when the server reports
+that it did not process the stream. A transport close or malformed response is
+not proof that the server did no work.
 
 ## License
 

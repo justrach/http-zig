@@ -38,7 +38,7 @@ pub fn write(w: *std.Io.Writer, f: Frame) !void {
     hdr[0] = @intCast((f.payload.len >> 16) & 0xff);
     hdr[1] = @intCast((f.payload.len >> 8) & 0xff);
     hdr[2] = @intCast(f.payload.len & 0xff);
-    hdr[3] = @intFromEnum(f.typ);
+    hdr[3] = @backingInt(f.typ);
     hdr[4] = f.flags;
     const sid: u32 = f.stream_id;
     hdr[5] = @intCast((sid >> 24) & 0x7f);
@@ -60,7 +60,7 @@ pub fn read(r: *std.Io.Reader, buf: []u8) !Frame {
     // records into the caller's storage before asking TLS to decode another.
     try r.readSliceAll(buf[0..len]);
     return .{
-        .typ = @enumFromInt(hdr[3]),
+        .typ = @fromBackingInt(@intCast(hdr[3])),
         .flags = hdr[4],
         .stream_id = stream_id,
         .payload = buf[0..len],
